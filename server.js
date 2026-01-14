@@ -18,14 +18,6 @@ const client = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY
 });
 
-function requireAuth(req, res, next) {
-  const token = req.headers["x-olympeus-token"];
-  if (!process.env.OLYMPEUS_SHARED_TOKEN || token !== process.env.OLYMPEUS_SHARED_TOKEN) {
-    return res.status(401).json({ error: "Unauthorized" });
-  }
-  next();
-}
-
 app.post("/profile-assist", requireAuth, async (req, res) => {
   try {
     const { role, goals, interests, location, avoid } = req.body;
@@ -113,6 +105,7 @@ Format: liste numérotée, chaque idée = un titre + 1 phrase de pitch.`;
     res.status(500).json({ error: "post-assist failed" });
   }
 });
+
 
 
 
