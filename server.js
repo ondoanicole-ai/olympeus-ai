@@ -42,13 +42,6 @@ app.get("/", (req, res) => res.send("OlympeUS AI API is running ✅"));
 
 const port = process.env.PORT || 3000;
 app.listen(port, () => console.log("Serveur lancé sur le port", port));
-app.post("/profile-assist", requireAuth, async (req, res) => {
-  try {
-    const { role, goals, interests, location, avoid, mode, draft } = req.body;
-
-    const system =
-      "Tu es l’assistant officiel d’écriture d’OlympeUS. Ton ton est chaleureux, neutre, positif. Tu tutoies. Tu n’inventes pas de faits.";
-
     const user =
       mode === "improve"
         ? `Réécris cette bio pour qu’elle soit plus claire et agréable, sans changer le sens. Bio:\n${draft || ""}`
@@ -105,6 +98,7 @@ Format: liste numérotée, chaque idée = un titre + 1 phrase de pitch.`;
     res.status(500).json({ error: "post-assist failed" });
   }
 });
+
 
 
 
