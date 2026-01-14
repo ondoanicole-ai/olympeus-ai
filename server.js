@@ -35,10 +35,12 @@ app.post("/profile-assist", requireAuth, async (req, res) => {
     res.status(500).json({ error: "Erreur IA" });
   }
 });
-app.get("/", (req, res) => res.send("OlympeUS AI API is running ✅"));
+
 
 app.get("/health", (req, res) => res.send("OK"));
+app.get("/", (req, res) => res.send("OlympeUS AI API is running ✅"));
 
 const port = process.env.PORT || 3000;
 app.listen(port, () => console.log("Serveur lancé sur le port", port));
+
 
