@@ -5,7 +5,6 @@ import OpenAI from "openai";
 const app = express();
 app.use(express.json({ limit: "1mb" }));
 
-// CORS (simple et permissif). Si tu veux restreindre à ton domaine plus tard, on le fera.
 app.use(
   cors({
     origin: "*",
@@ -15,8 +14,8 @@ app.use(
 );
 
 // --- ENV (Render) ---
-const OPENAI_API_KEY = process.env.OPENAI_API_KEY; // <-- clé OpenAI
-const OLYMPEUS_SHARED_TOKEN = process.env.OLYMPEUS_SHARED_TOKEN; // <-- ton token partagé
+const OPENAI_API_KEY = process.env.OPENAI_API_KEY; 
+const OLYMPEUS_SHARED_TOKEN = process.env.OLYMPEUS_SHARED_TOKEN; 
 
 if (!OPENAI_API_KEY) console.warn("⚠️ OPENAI_API_KEY manquant.");
 if (!OLYMPEUS_SHARED_TOKEN) console.warn("⚠️ OLYMPEUS_SHARED_TOKEN manquant.");
@@ -317,5 +316,6 @@ app.get("/test-ai", async (req, res) => {
     });
   }
 });
+
 
 
