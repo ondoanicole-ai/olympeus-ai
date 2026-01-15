@@ -140,19 +140,39 @@ app.post("/post-assist", requireAuth, async (req, res) => {
     const { mode, theme, draft } = req.body || {};
 
     let userPrompt = "";
-    if (mode === "ideas") {
-      userPrompt = `Donne 7 idées de publication OlympeUS sur le thème: ${theme || "Création"}.
-Format: liste numérotée, chaque idée = (Titre) + (1 phrase de pitch) + (1 call-to-action).`;
-    } else if (mode === "improve") {
-      userPrompt = `Réécris ce post pour qu'il soit plus clair, plus agréable et respectueux, sans changer le sens.
-Post:\n${draft || ""}\n\nDonne 2 versions: (A) courte (B) plus engageante.`;
-    } else if (mode === "summary") {
-      userPrompt = `Résume ce texte en 5 points + une phrase finale.
-Texte:\n${draft || ""}`;
-    } else {
-      userPrompt = `Génère un texte original OlympeUS sur: ${theme || "OlympeUS"}.
-Contraintes: 150-220 mots, ton chaleureux et neutre, tutoiement, termine par une question.`;
-    }
+   let userPrompt = "";
+
+if (mode === "ideas") {
+  userPrompt = `
+Tu es l'assistant officiel d’OlympeUS.
+Donne 5 informations claires, utiles et engageantes sur OlympeUS.
+Format :
+- Liste numérotée
+- 1 phrase par point
+`;
+}
+
+else if (mode === "improve") {
+  userPrompt = `
+Corrige et améliore le texte suivant.
+Donne exactement 2 versions :
+
+(A) Version courte et correcte
+(B) Version plus naturelle et engageante
+
+Texte :
+"${draft}"
+`;
+}
+
+else if (mode === "resume") {
+  userPrompt = `
+Résume le texte suivant en 1 ou 2 phrases maximum, de façon claire.
+
+Texte :
+"${draft}"
+`;
+}
 
     const r = await client.responses.create({
       model: "gpt-5-mini",
@@ -316,6 +336,7 @@ app.get("/test-ai", async (req, res) => {
     });
   }
 });
+
 
 
 
