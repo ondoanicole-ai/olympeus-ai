@@ -1,48 +1,41 @@
 import express from "express";
 import cors from "cors";
 import OpenAI from "openai";
+import fetch from "node-fetch";
 
 const app = express();
-app.use(express.json({ limit: "1mb" }));
 
-app.use(
-  cors({
-    origin: "*",
-    methods: ["GET", "POST", "OPTIONS"],
-    allowedHeaders: ["Content-Type", "x-olympeus-token"],
-  })
-);
-
-// ---- ENV (Render) ----
+/* ------------------ CONFIG (ENV Render) ------------------ */
+const PORT = process.env.PORT || 3000;
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 const OLYMPEUS_SHARED_TOKEN = process.env.OLYMPEUS_SHARED_TOKEN;
-const TAVILY_API_KEY = process.env.TAVILY_API_KEY || "";
+const TAVILY_API_KEY = process.env.TAVILY_API_KEY;
 
-if (!OPENAI_API_KEY) console.warn("⚠ OPENAI_API_KEY manquant.");
-if (!OLYMPEUS_SHARED_TOKEN) console.warn("⚠ OLYMPEUS_SHARED_TOKEN manquant.");
+/* ------------------ MIDDLEWARE ------------------ */
+app.use(cors({ origin: "*", allowedHeaders: ["Content-Type", "x-olympeus-token"] }));
+app.use(express.json({ limit: "1mb" }));
 
-const client = new OpenAI({ apiKey: OPENAI_API_KEY });
-
-// ---- Auth ----
 function requireAuth(req, res, next) {
   const token = req.headers["x-olympeus-token"];
-  if (!OLYMPEUS_SHARED_TOKEN || token !== OLYMPEUS_SHARED_TOKEN) {
+  if (!token || token !== OLYMPEUS_SHARED_TOKEN) {
     return res.status(401).json({ error: "Unauthorized" });
   }
   next();
 }
 
-// ---- Helpers ----
-function clampMessages(history) {
-  if (!Array.isArray(history)) return [];
-  // on garde les 12 derniers messages max
-  return history
-    .filter(m => m && (m.role === "user" || m.role === "assistant") && typeof m.content === "string")
-    .slice(-12);
-}
+/* ------------------ OPENAI CLIENT ------------------ */
+if (!OPENAI_API_KEY) console.warn("⚠️ OPENAI_API_KEY manquant dans Render");
+const client = new OpenAI({ apiKey: OPENAI_API_KEY });
 
+/* ------------------ HEALTH ------------------ */
+app.get("/", (_, res) => {
+  res.send("OlympeUS AI API is running ✅");
+});
+
+/* ------------------ TAVILY SEARCH ------------------ */
 async function tavilySearch(query) {
-  if (!TAVILY_API_KEY) return { ok: false, error: "TAVILY_API_KEY manquant" };
+  if (!TAVILY_API_KEY) return { ok: false, error: "Tavily API key missing" };
+
   const r = await fetch("https://api.tavily.com/search", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -50,140 +43,73 @@ async function tavilySearch(query) {
       api_key: TAVILY_API_KEY,
       query,
       search_depth: "basic",
-      max_results: 5,
-      include_answer: false,
-      include_raw_content: false,
-    }),
+      max_results: 5
+    })
   });
-  if (!r.ok) {
-    const txt = await r.text();
-    return { ok: false, error: `Tavily HTTP ${r.status}: ${txt}` };
-  }
-  const data = await r.json();
-  const results = (data.results || []).map(x => ({
-    title: x.title,
-    url: x.url,
-    snippet: x.content,
-  }));
-  return { ok: true, results };
+
+  const json = await r.json();
+  if (!r.ok) return { ok: false, error: json?.error || "Tavily error" };
+
+  return { ok: true, results: json.results || [] };
 }
 
-async function moderate(text) {
-  // Modération OpenAI (simple)
-  const resp = await client.moderations.create({
-    model: "omni-moderation-latest",
-    input: text,
-  });
-  const r = resp.results?.[0];
-  const flagged = !!r?.flagged;
-  return { flagged, categories: r?.categories || {}, scores: r?.category_scores || {} };
-}
-
-// ---- Routes ----
-app.get("/", (req, res) => res.send("OlympeUS AI API is running ✅"));
-app.get("/health", (req, res) => res.send("OK"));
-
-/**
- * POST /post-assist
- * body: {
- *  mode: "chat"|"ideas"|"improve"|"summary",
- *  draft?: string,
- *  theme?: string,
- *  history?: [{role:"user"|"assistant", content:string}],
- *  web?: { enabled?: boolean, query?: string }
- * }
- */
+/* ------------------ CHAT / IDEAS / IMPROVE / SUMMARY ------------------ */
 app.post("/post-assist", requireAuth, async (req, res) => {
   try {
-    const mode = (req.body?.mode || "chat").toString();
-    const draft = (req.body?.draft || "").toString();
-    const theme = (req.body?.theme || "OlympeUS").toString();
-    const history = clampMessages(req.body?.history);
+    const { mode = "chat", draft = "", context = "" } = req.body;
 
-    // 1) Modération (sur le texte envoyé)
-    const mod = await moderate(draft);
-    if (mod.flagged) {
-      return res.status(400).json({
-        error: "Contenu bloqué par la modération.",
-        moderation: mod,
-      });
-    }
+    const systemPrompt =
+      "Tu es OlympeUS, assistant francophone, chaleureux, neutre et respectueux (tu tutoies). " +
+      "Réponds clairement et sans inventer des faits.";
 
-    // 2) Recherche web (optionnelle)
-    let webContext = "";
-    let webResults = [];
-    const webEnabled = !!req.body?.web?.enabled;
-    const webQuery = (req.body?.web?.query || "").toString().trim();
+    let userPrompt = draft;
 
-    if (webEnabled && webQuery) {
-      const s = await tavilySearch(webQuery);
-      if (s.ok) {
-        webResults = s.results;
-        // mini contexte injecté
-        webContext =
-          "Résultats web (sources) :\n" +
-          webResults
-            .map((r, i) => `(${i + 1}) ${r.title}\n${r.url}\n${r.snippet}`)
-            .join("\n\n");
-      } else {
-        webContext = `Recherche web indisponible: ${s.error}`;
-      }
-    }
-
-    // 3) Prompt selon mode
-    const system =
-      `Tu es l’assistant OlympeUS. Ton ton est chaleureux, neutre, respectueux, et tu tutoies.
-Règles:
-- Réponds en français.
-- Sois concret, utile, pas de blabla.
-- Si la recherche web est fournie, cite les sources avec (1)(2)(3) dans le texte.`;
-
-    let userInstruction = "";
     if (mode === "ideas") {
-      userInstruction =
-        `Donne 5 idées de publication pour OlympeUS sur le thème: "${theme}". 
-Format: liste numérotée. Chaque idée = un titre + 1 phrase de pitch.`;
+      userPrompt = `Donne 5 idées utiles et concrètes à partir du texte suivant:\n${draft}`;
     } else if (mode === "improve") {
-      userInstruction =
-        `Améliore ce texte sans changer le sens. Corrige l’orthographe, rends-le plus clair et engageant.
-Donne 2 versions:
-(A) courte
-(B) plus engageante
-Texte:\n${draft}`;
+      userPrompt = `Améliore le texte ci-dessous avec 2 versions (A et B). Garde le sens:\n${draft}`;
     } else if (mode === "summary") {
-      userInstruction =
-        `Fais une synthèse en 3 bullet points max, puis une phrase de conclusion.
-Texte:\n${draft}`;
+      userPrompt = `Fais un résumé clair (2-3 phrases max) du texte suivant:\n${draft}`;
     } else {
-      // chat
-      userInstruction = `Réponds au dernier message de l’utilisateur de façon utile et naturelle.\nMessage:\n${draft}`;
+      // mode chat
+      userPrompt = draft;
     }
 
-    const inputMessages = [
-      { role: "system", content: system },
-      ...(webContext ? [{ role: "system", content: webContext }] : []),
-      ...history,
-      { role: "user", content: userInstruction },
-    ];
+    if (context) {
+      userPrompt = `Voici des sources/contexte:\n${context}\n\nMessage utilisateur:\n${userPrompt}`;
+    }
 
-    // 4) Appel modèle
     const r = await client.responses.create({
       model: "gpt-4.1-mini",
-      input: inputMessages,
+      input: [
+        { role: "system", content: systemPrompt },
+        { role: "user", content: userPrompt }
+      ]
     });
 
-    const text = r.output_text || "";
-
-    return res.json({
-      text,
-      web_results: webResults,
-      moderation: { flagged: mod.flagged },
-    });
+    res.json({ text: r.output_text });
   } catch (e) {
-    console.error("post-assist error:", e);
-    return res.status(500).json({ error: "post-assist failed" });
+    console.error(e);
+    res.status(500).json({ error: "post-assist failed" });
   }
 });
 
-const port = process.env.PORT || 3000;
-app.listen(port, () => console.log("Serveur lancé sur le port", port));
+/* ------------------ WEB SEARCH ENDPOINT ------------------ */
+app.post("/web-search", requireAuth, async (req, res) => {
+  try {
+    const q = (req.body.query || "").trim();
+    if (!q) return res.status(400).json({ error: "Query missing" });
+
+    const s = await tavilySearch(q);
+    if (!s.ok) return res.status(500).json({ error: s.error });
+
+    res.json({ results: s.results });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: "web-search failed" });
+  }
+});
+
+/* ------------------ START ------------------ */
+app.listen(PORT, () => console.log("Server running on port", PORT));
+
