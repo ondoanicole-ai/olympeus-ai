@@ -13,23 +13,17 @@ app.use(
   })
 );
 
-// ===== ENV (Render) =====
+// ---- ENV (Render) ----
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 const OLYMPEUS_SHARED_TOKEN = process.env.OLYMPEUS_SHARED_TOKEN;
+const TAVILY_API_KEY = process.env.TAVILY_API_KEY || "";
 
-// (Optionnel) Recherche web via Serper.dev (Google)
-// Crée une clé sur serper.dev puis mets SERPER_API_KEY dans Render.
-const SERPER_API_KEY = process.env.SERPER_API_KEY;
-
-// Modèle demandé
-const MODEL = "gpt-4.1-mini";
-
-if (!OPENAI_API_KEY) console.warn("⚠️ OPENAI_API_KEY manquant.");
-if (!OLYMPEUS_SHARED_TOKEN) console.warn("⚠️ OLYMPEUS_SHARED_TOKEN manquant.");
+if (!OPENAI_API_KEY) console.warn("⚠ OPENAI_API_KEY manquant.");
+if (!OLYMPEUS_SHARED_TOKEN) console.warn("⚠ OLYMPEUS_SHARED_TOKEN manquant.");
 
 const client = new OpenAI({ apiKey: OPENAI_API_KEY });
 
-// ===== Auth middleware =====
+// ---- Auth ----
 function requireAuth(req, res, next) {
   const token = req.headers["x-olympeus-token"];
   if (!OLYMPEUS_SHARED_TOKEN || token !== OLYMPEUS_SHARED_TOKEN) {
@@ -38,246 +32,143 @@ function requireAuth(req, res, next) {
   next();
 }
 
-// ===== Helpers =====
-function safeStr(x, max = 6000) {
-  return (x ?? "").toString().trim().slice(0, max);
+// ---- Helpers ----
+function clampMessages(history) {
+  if (!Array.isArray(history)) return [];
+  // on garde les 12 derniers messages max
+  return history
+    .filter(m => m && (m.role === "user" || m.role === "assistant") && typeof m.content === "string")
+    .slice(-12);
 }
 
-function sanitizeMessages(messages) {
-  if (!Array.isArray(messages)) return [];
-  return messages
-    .slice(-20)
-    .map((m) => ({
-      role: m?.role === "assistant" ? "assistant" : "user",
-      content: safeStr(m?.content, 2000),
-    }))
-    .filter((m) => m.content.length > 0);
-}
-
-function isBlockedBySoftModeration(text) {
-  const t = (text || "").toLowerCase();
-  const blocked = [
-    "tuer",
-    "suicide",
-    "me suicider",
-    "bombe",
-    "explosif",
-    "arme",
-    "porn",
-    "pédophile",
-  ];
-  return blocked.some((w) => t.includes(w));
-}
-
-async function webSearchSerper(query) {
-  if (!SERPER_API_KEY) return [];
-  const q = safeStr(query, 200);
-
-  const r = await fetch("https://google.serper.dev/search", {
+async function tavilySearch(query) {
+  if (!TAVILY_API_KEY) return { ok: false, error: "TAVILY_API_KEY manquant" };
+  const r = await fetch("https://api.tavily.com/search", {
     method: "POST",
-    headers: {
-      "X-API-KEY": SERPER_API_KEY,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({ q, num: 5 }),
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      api_key: TAVILY_API_KEY,
+      query,
+      search_depth: "basic",
+      max_results: 5,
+      include_answer: false,
+      include_raw_content: false,
+    }),
   });
-
   if (!r.ok) {
-    const txt = await r.text().catch(() => "");
-    throw new Error(`Serper error ${r.status}: ${txt.slice(0, 120)}`);
+    const txt = await r.text();
+    return { ok: false, error: `Tavily HTTP ${r.status}: ${txt}` };
   }
-
   const data = await r.json();
-  const items = Array.isArray(data?.organic) ? data.organic : [];
-  return items.slice(0, 5).map((it) => ({
-    title: safeStr(it?.title, 140),
-    link: safeStr(it?.link, 400),
-    snippet: safeStr(it?.snippet, 280),
+  const results = (data.results || []).map(x => ({
+    title: x.title,
+    url: x.url,
+    snippet: x.content,
   }));
+  return { ok: true, results };
 }
 
-function buildSystemPrompt() {
-  return `
-Tu es l’assistant de contenu d’OlympeUS.
-Ton ton est chaleureux, neutre, respectueux. Tu tutoies.
-Tu aides à: idées de posts, amélioration, résumé, conversation multi-tours.
-Si des "sources web" sont fournies, utilise-les pour répondre et cite les liens (1–3 max).
-Ne divulgue jamais de clés, tokens ou secrets.
-`.trim();
+async function moderate(text) {
+  // Modération OpenAI (simple)
+  const resp = await client.moderations.create({
+    model: "omni-moderation-latest",
+    input: text,
+  });
+  const r = resp.results?.[0];
+  const flagged = !!r?.flagged;
+  return { flagged, categories: r?.categories || {}, scores: r?.category_scores || {} };
 }
 
-function buildTaskPrompt(mode, draft, theme) {
-  const th = safeStr(theme || "OlympeUS", 60);
-
-  if (mode === "ideas") {
-    return `
-Objectif: proposer 6 idées de publications utiles pour l'utilisateur.
-Contexte: OlympeUS / thème: ${th}
-Texte utilisateur (si présent): ${safeStr(draft, 1200)}
-Format: liste numérotée. Pour chaque idée: Titre + 1 phrase de pitch + 1 call-to-action.
-`.trim();
-  }
-
-  if (mode === "improve") {
-    return `
-Réécris le texte ci-dessous en 2 versions:
-(A) courte, claire (orthographe + style)
-(B) plus engageante, sans changer le sens
-Texte: ${safeStr(draft, 1600)}
-`.trim();
-  }
-
-  if (mode === "resume") {
-    return `
-Résume le texte ci-dessous en 3–5 puces, puis donne une phrase de conclusion.
-Texte: ${safeStr(draft, 1600)}
-`.trim();
-  }
-
-  // chat
-  return `
-Tu réponds à l’utilisateur en conversation multi-tours, de façon utile et concrète.
-Dernier message utilisateur: ${safeStr(draft, 1600)}
-`.trim();
-}
-
-function formatContext(siteContext = [], webResults = []) {
-  const site = Array.isArray(siteContext) ? siteContext.slice(0, 6) : [];
-  const web = Array.isArray(webResults) ? webResults.slice(0, 5) : [];
-
-  let out = "";
-  if (site.length) {
-    out += "CONTEXTE SITE (titres/liens):\n";
-    out += site
-      .map((s, i) => `- ${i + 1}. ${safeStr(s?.title, 120)} — ${safeStr(s?.url, 300)}`)
-      .join("\n");
-    out += "\n\n";
-  }
-
-  if (web.length) {
-    out += "SOURCES WEB:\n";
-    out += web
-      .map(
-        (w, i) =>
-          `- ${i + 1}. ${safeStr(w?.title, 140)}\n  ${safeStr(w?.snippet, 260)}\n  ${safeStr(w?.link, 350)}`
-      )
-      .join("\n");
-    out += "\n\n";
-  }
-
-  return out.trim();
-}
-
-// ===== Routes =====
-app.get("/health", (req, res) => res.send("OK"));
+// ---- Routes ----
 app.get("/", (req, res) => res.send("OlympeUS AI API is running ✅"));
+app.get("/health", (req, res) => res.send("OK"));
 
+/**
+ * POST /post-assist
+ * body: {
+ *  mode: "chat"|"ideas"|"improve"|"summary",
+ *  draft?: string,
+ *  theme?: string,
+ *  history?: [{role:"user"|"assistant", content:string}],
+ *  web?: { enabled?: boolean, query?: string }
+ * }
+ */
 app.post("/post-assist", requireAuth, async (req, res) => {
   try {
-    const { mode, theme, draft, messages } = req.body || {};
+    const mode = (req.body?.mode || "chat").toString();
+    const draft = (req.body?.draft || "").toString();
+    const theme = (req.body?.theme || "OlympeUS").toString();
+    const history = clampMessages(req.body?.history);
 
-    // 1) On accepte soit messages (chat multi-tours), soit draft (1 tour)
-    const hasMessages = Array.isArray(messages) && messages.length > 0;
-    const userText = (draft || "").trim();
-
-    if (!hasMessages && !userText) {
-      return res.json({ text: "Écris-moi ta demande dans le champ en bas, puis clique Envoyer 🙂" });
-    }
-
-    // 2) Construction du prompt selon le mode
-    const system = `Tu es OlympeUS. Ton ton est chaleureux, neutre, et tu tutoies.`;
-
-    let inputMessages;
-
-    if (mode === "chat") {
-      inputMessages = [
-        { role: "system", content: system },
-        ...(hasMessages
-          ? messages
-          : [{ role: "user", content: userText }])
-      ];
-    } else if (mode === "ideas") {
-      inputMessages = [
-        { role: "system", content: system },
-        { role: "user", content: `Donne 5 idées de publication sur: ${theme || "OlympeUS"}.` }
-      ];
-    } else if (mode === "improve") {
-      inputMessages = [
-        { role: "system", content: system },
-        { role: "user", content: `Améliore ce texte (sans changer le sens) :\n${userText}` }
-      ];
-    } else if (mode === "summary") {
-      inputMessages = [
-        { role: "system", content: system },
-        { role: "user", content: `Résume ce texte :\n${userText}` }
-      ];
-    } else {
-      inputMessages = [
-        { role: "system", content: system },
-        { role: "user", content: userText || "Dis bonjour." }
-      ];
-    }
-
-    const r = await client.responses.create({
-      model: "gpt-4.1-mini",
-      input: inputMessages
-    });
-
-    return res.json({ text: r.output_text });
-  } catch (e) {
-    return res.status(500).json({ error: "post-assist failed" });
-  }
-});
-
-    const draftSafe = safeStr(draft, 6000);
-
-    // Soft moderation (option)
-    if (moderation && isBlockedBySoftModeration(draftSafe)) {
+    // 1) Modération (sur le texte envoyé)
+    const mod = await moderate(draft);
+    if (mod.flagged) {
       return res.status(400).json({
-        error: "Contenu bloqué par la modération (soft). Reformule ton texte.",
+        error: "Contenu bloqué par la modération.",
+        moderation: mod,
       });
     }
 
-    // Web search (option)
+    // 2) Recherche web (optionnelle)
+    let webContext = "";
     let webResults = [];
-    if (webSearch && safeStr(webQuery, 200)) {
-      try {
-        webResults = await webSearchSerper(webQuery);
-      } catch (e) {
-        // On n’échoue pas toute la requête si la recherche web a un souci
-        console.warn("Web search failed:", e.message);
+    const webEnabled = !!req.body?.web?.enabled;
+    const webQuery = (req.body?.web?.query || "").toString().trim();
+
+    if (webEnabled && webQuery) {
+      const s = await tavilySearch(webQuery);
+      if (s.ok) {
+        webResults = s.results;
+        // mini contexte injecté
+        webContext =
+          "Résultats web (sources) :\n" +
+          webResults
+            .map((r, i) => `(${i + 1}) ${r.title}\n${r.url}\n${r.snippet}`)
+            .join("\n\n");
+      } else {
+        webContext = `Recherche web indisponible: ${s.error}`;
       }
     }
 
-    const sys = buildSystemPrompt();
-    const task = buildTaskPrompt(mode, draftSafe, theme);
-    const convo = sanitizeMessages(messages);
+    // 3) Prompt selon mode
+    const system =
+      `Tu es l’assistant OlympeUS. Ton ton est chaleureux, neutre, respectueux, et tu tutoies.
+Règles:
+- Réponds en français.
+- Sois concret, utile, pas de blabla.
+- Si la recherche web est fournie, cite les sources avec (1)(2)(3) dans le texte.`;
 
-    // Contexte (site + web)
-    const ctx = formatContext(siteContext, webResults);
+    let userInstruction = "";
+    if (mode === "ideas") {
+      userInstruction =
+        `Donne 5 idées de publication pour OlympeUS sur le thème: "${theme}". 
+Format: liste numérotée. Chaque idée = un titre + 1 phrase de pitch.`;
+    } else if (mode === "improve") {
+      userInstruction =
+        `Améliore ce texte sans changer le sens. Corrige l’orthographe, rends-le plus clair et engageant.
+Donne 2 versions:
+(A) courte
+(B) plus engageante
+Texte:\n${draft}`;
+    } else if (mode === "summary") {
+      userInstruction =
+        `Fais une synthèse en 3 bullet points max, puis une phrase de conclusion.
+Texte:\n${draft}`;
+    } else {
+      // chat
+      userInstruction = `Réponds au dernier message de l’utilisateur de façon utile et naturelle.\nMessage:\n${draft}`;
+    }
 
     const inputMessages = [
-      { role: "system", content: sys },
-      ...(ctx ? [{ role: "system", content: ctx }] : []),
+      { role: "system", content: system },
+      ...(webContext ? [{ role: "system", content: webContext }] : []),
+      ...history,
+      { role: "user", content: userInstruction },
     ];
 
-    // Pour le mode chat, on injecte l’historique, sinon on fait simple
-    if (mode === "chat" && convo.length) {
-      inputMessages.push(...convo);
-      // Si le dernier message n'est pas déjà celui du draft, on l'ajoute
-      if (draftSafe && convo[convo.length - 1]?.content !== draftSafe) {
-        inputMessages.push({ role: "user", content: draftSafe });
-      }
-    } else {
-      inputMessages.push({ role: "user", content: task });
-    }
-
-    if (!OPENAI_API_KEY) {
-      return res.status(500).json({ error: "OPENAI_API_KEY manquant côté Render." });
-    }
-
+    // 4) Appel modèle
     const r = await client.responses.create({
-      model: MODEL,
+      model: "gpt-4.1-mini",
       input: inputMessages,
     });
 
@@ -286,6 +177,7 @@ app.post("/post-assist", requireAuth, async (req, res) => {
     return res.json({
       text,
       web_results: webResults,
+      moderation: { flagged: mod.flagged },
     });
   } catch (e) {
     console.error("post-assist error:", e);
@@ -295,4 +187,3 @@ app.post("/post-assist", requireAuth, async (req, res) => {
 
 const port = process.env.PORT || 3000;
 app.listen(port, () => console.log("Serveur lancé sur le port", port));
-
