@@ -13,330 +13,241 @@ app.use(
   })
 );
 
-// --- ENV (Render) ---
-const OPENAI_API_KEY = process.env.OPENAI_API_KEY; 
-const OLYMPEUS_SHARED_TOKEN = process.env.OLYMPEUS_SHARED_TOKEN; 
+// ===== ENV (Render) =====
+const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
+const OLYMPEUS_SHARED_TOKEN = process.env.OLYMPEUS_SHARED_TOKEN;
+
+// (Optionnel) Recherche web via Serper.dev (Google)
+// Crée une clé sur serper.dev puis mets SERPER_API_KEY dans Render.
+const SERPER_API_KEY = process.env.SERPER_API_KEY;
+
+// Modèle demandé
+const MODEL = "gpt-4.1-mini";
 
 if (!OPENAI_API_KEY) console.warn("⚠️ OPENAI_API_KEY manquant.");
 if (!OLYMPEUS_SHARED_TOKEN) console.warn("⚠️ OLYMPEUS_SHARED_TOKEN manquant.");
 
 const client = new OpenAI({ apiKey: OPENAI_API_KEY });
 
-// --- Auth middleware (token partagé) ---
+// ===== Auth middleware =====
 function requireAuth(req, res, next) {
   const token = req.headers["x-olympeus-token"];
-  if (!OLYMPEUS_SHARED_TOKEN || !token || token !== OLYMPEUS_SHARED_TOKEN) {
+  if (!OLYMPEUS_SHARED_TOKEN || token !== OLYMPEUS_SHARED_TOKEN) {
     return res.status(401).json({ error: "Unauthorized" });
   }
   next();
 }
 
-// --- Mémoire conversation (en RAM) ---
-// ⚠️ Sur Render free, ça peut redémarrer => mémoire remise à zéro. Plus tard on pourra stocker en DB.
-const conversations = new Map(); // conversationId -> [{role, content}, ...]
-
-function getHistory(conversationId) {
-  if (!conversationId) return [];
-  if (!conversations.has(conversationId)) conversations.set(conversationId, []);
-  return conversations.get(conversationId);
+// ===== Helpers =====
+function safeStr(x, max = 6000) {
+  return (x ?? "").toString().trim().slice(0, max);
 }
 
-function pushHistory(conversationId, role, content) {
-  if (!conversationId) return;
-  const hist = getHistory(conversationId);
-  hist.push({ role, content });
-
-  // garde max 20 messages pour éviter de gonfler
-  if (hist.length > 20) hist.splice(0, hist.length - 20);
+function sanitizeMessages(messages) {
+  if (!Array.isArray(messages)) return [];
+  return messages
+    .slice(-20)
+    .map((m) => ({
+      role: m?.role === "assistant" ? "assistant" : "user",
+      content: safeStr(m?.content, 2000),
+    }))
+    .filter((m) => m.content.length > 0);
 }
 
-// --- Mini base de "recherche" (tu peux la remplir) ---
-const KB = [
-  {
-    id: "olympeus-vision",
-    title: "Vision OlympeUS",
-    text: "OlympeUS est un paradis social centré sur les utilisateurs: se divertir, créer, s'entraider, réseauter, publier, partager et monétiser via e-commerce.",
-    tags: ["vision", "social", "communauté"],
-  },
-  {
-    id: "olympeus-espaces",
-    title: "Espaces clés",
-    text: "Espaces recommandés: Emploi, Entrepreneuriat, Société, Politique, Religion, Culture, Business, Création.",
-    tags: ["espaces", "thématiques"],
-  },
-];
-
-// Utilitaire: recherche simple dans KB
-function simpleSearch(query) {
-  const q = (query || "").toLowerCase().trim();
-  if (!q) return [];
-  return KB.filter(
-    (doc) =>
-      doc.title.toLowerCase().includes(q) ||
-      doc.text.toLowerCase().includes(q) ||
-      doc.tags.some((t) => t.toLowerCase().includes(q))
-  ).slice(0, 5);
+function isBlockedBySoftModeration(text) {
+  const t = (text || "").toLowerCase();
+  const blocked = [
+    "tuer",
+    "suicide",
+    "me suicider",
+    "bombe",
+    "explosif",
+    "arme",
+    "porn",
+    "pédophile",
+  ];
+  return blocked.some((w) => t.includes(w));
 }
 
-// --- Prompts (ton chaleureux, neutre, tutoie) ---
-const SYSTEM_BASE = `
-Tu es l'assistant officiel d'OlympeUS.
+async function webSearchSerper(query) {
+  if (!SERPER_API_KEY) return [];
+  const q = safeStr(query, 200);
+
+  const r = await fetch("https://google.serper.dev/search", {
+    method: "POST",
+    headers: {
+      "X-API-KEY": SERPER_API_KEY,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({ q, num: 5 }),
+  });
+
+  if (!r.ok) {
+    const txt = await r.text().catch(() => "");
+    throw new Error(`Serper error ${r.status}: ${txt.slice(0, 120)}`);
+  }
+
+  const data = await r.json();
+  const items = Array.isArray(data?.organic) ? data.organic : [];
+  return items.slice(0, 5).map((it) => ({
+    title: safeStr(it?.title, 140),
+    link: safeStr(it?.link, 400),
+    snippet: safeStr(it?.snippet, 280),
+  }));
+}
+
+function buildSystemPrompt() {
+  return `
+Tu es l’assistant de contenu d’OlympeUS.
 Ton ton est chaleureux, neutre, respectueux. Tu tutoies.
-Tu aides à créer du contenu, à structurer des idées, à rédiger des posts, et à proposer des espaces (thématiques) pertinents.
-Réponds en français.
-`;
+Tu aides à: idées de posts, amélioration, résumé, conversation multi-tours.
+Si des "sources web" sont fournies, utilise-les pour répondre et cite les liens (1–3 max).
+Ne divulgue jamais de clés, tokens ou secrets.
+`.trim();
+}
 
-// ============== ROUTES ==============
+function buildTaskPrompt(mode, draft, theme) {
+  const th = safeStr(theme || "OlympeUS", 60);
 
-// Health + home
+  if (mode === "ideas") {
+    return `
+Objectif: proposer 6 idées de publications utiles pour l'utilisateur.
+Contexte: OlympeUS / thème: ${th}
+Texte utilisateur (si présent): ${safeStr(draft, 1200)}
+Format: liste numérotée. Pour chaque idée: Titre + 1 phrase de pitch + 1 call-to-action.
+`.trim();
+  }
+
+  if (mode === "improve") {
+    return `
+Réécris le texte ci-dessous en 2 versions:
+(A) courte, claire (orthographe + style)
+(B) plus engageante, sans changer le sens
+Texte: ${safeStr(draft, 1600)}
+`.trim();
+  }
+
+  if (mode === "resume") {
+    return `
+Résume le texte ci-dessous en 3–5 puces, puis donne une phrase de conclusion.
+Texte: ${safeStr(draft, 1600)}
+`.trim();
+  }
+
+  // chat
+  return `
+Tu réponds à l’utilisateur en conversation multi-tours, de façon utile et concrète.
+Dernier message utilisateur: ${safeStr(draft, 1600)}
+`.trim();
+}
+
+function formatContext(siteContext = [], webResults = []) {
+  const site = Array.isArray(siteContext) ? siteContext.slice(0, 6) : [];
+  const web = Array.isArray(webResults) ? webResults.slice(0, 5) : [];
+
+  let out = "";
+  if (site.length) {
+    out += "CONTEXTE SITE (titres/liens):\n";
+    out += site
+      .map((s, i) => `- ${i + 1}. ${safeStr(s?.title, 120)} — ${safeStr(s?.url, 300)}`)
+      .join("\n");
+    out += "\n\n";
+  }
+
+  if (web.length) {
+    out += "SOURCES WEB:\n";
+    out += web
+      .map(
+        (w, i) =>
+          `- ${i + 1}. ${safeStr(w?.title, 140)}\n  ${safeStr(w?.snippet, 260)}\n  ${safeStr(w?.link, 350)}`
+      )
+      .join("\n");
+    out += "\n\n";
+  }
+
+  return out.trim();
+}
+
+// ===== Routes =====
 app.get("/health", (req, res) => res.send("OK"));
 app.get("/", (req, res) => res.send("OlympeUS AI API is running ✅"));
 
-// 1) Profil: bio + accroche + tags + espaces recommandés (incluant Religion)
-app.post("/profile-assist", requireAuth, async (req, res) => {
-  try {
-    const { mode, role, goals, interests, location, avoid, draft } = req.body || {};
-
-    const userPrompt =
-      mode === "improve"
-        ? `Améliore cette bio sans changer le fond. Bio:\n${draft || ""}\n\nContraintes:
-- 1 accroche (1 ligne)
-- 1 bio (80-120 mots)
-- 10 tags
-- 5 espaces recommandés parmi: Emploi, Entrepreneuriat, Société, Politique, Religion, Culture, Business, Création
-- Style: clair, chaleureux, neutre, tutoiement`
-        : `Génère un profil OlympeUS.
-Infos:
-- Rôle/activité: ${role || ""}
-- Objectifs: ${goals || ""}
-- Centres d'intérêt: ${interests || ""}
-- Ville/pays: ${location || ""}
-- À éviter: ${avoid || ""}
-
-Format de sortie EXACT:
-1) Accroche:
-2) Bio:
-3) Tags:
-4) Espaces recommandés:`;
-
-    const r = await client.responses.create({
-      model: "gpt-5-mini",
-      input: [
-        { role: "system", content: SYSTEM_BASE },
-        { role: "user", content: userPrompt },
-      ],
-    });
-
-    res.json({ text: r.output_text });
-  } catch (e) {
-    console.error("profile-assist error:", e?.message || e);
-    res.status(500).json({ error: "profile-assist failed" });
-  }
-});
-
-// 2) Post: idées / amélioration / résumé / génération libre
 app.post("/post-assist", requireAuth, async (req, res) => {
   try {
-    const { mode, theme, draft } = req.body || {};
+    const {
+      mode = "chat",
+      draft = "",
+      theme = "OlympeUS",
+      messages = [],
+      siteContext = [],
+      moderation = true,
+      webSearch = false,
+      webQuery = "",
+    } = req.body || {};
 
-    let userPrompt = "";
-   let userPrompt = "";
+    const draftSafe = safeStr(draft, 6000);
 
-if (mode === "ideas") {
-  userPrompt = `
-Tu es l'assistant officiel d’OlympeUS.
-Donne 5 informations claires, utiles et engageantes sur OlympeUS.
-Format :
-- Liste numérotée
-- 1 phrase par point
-`;
-}
-
-else if (mode === "improve") {
-  userPrompt = `
-Corrige et améliore le texte suivant.
-Donne exactement 2 versions :
-
-(A) Version courte et correcte
-(B) Version plus naturelle et engageante
-
-Texte :
-"${draft}"
-`;
-}
-
-else if (mode === "resume") {
-  userPrompt = `
-Résume le texte suivant en 1 ou 2 phrases maximum, de façon claire.
-
-Texte :
-"${draft}"
-`;
-}
-
-    const r = await client.responses.create({
-      model: "gpt-5-mini",
-      input: [
-        { role: "system", content: SYSTEM_BASE },
-        { role: "user", content: userPrompt },
-      ],
-    });
-
-    res.json({ text: r.output_text });
-  } catch (e) {
-    console.error("post-assist error:", e?.message || e);
-    res.status(500).json({ error: "post-assist failed" });
-  }
-});
-
-// 3) Conversation (chat) avec mémoire (conversationId)
-app.post("/chat", requireAuth, async (req, res) => {
-  try {
-    const { conversationId, message } = req.body || {};
-    if (!message || !String(message).trim()) {
-      return res.status(400).json({ error: "message missing" });
+    // Soft moderation (option)
+    if (moderation && isBlockedBySoftModeration(draftSafe)) {
+      return res.status(400).json({
+        error: "Contenu bloqué par la modération (soft). Reformule ton texte.",
+      });
     }
 
-    const history = getHistory(conversationId);
+    // Web search (option)
+    let webResults = [];
+    if (webSearch && safeStr(webQuery, 200)) {
+      try {
+        webResults = await webSearchSerper(webQuery);
+      } catch (e) {
+        // On n’échoue pas toute la requête si la recherche web a un souci
+        console.warn("Web search failed:", e.message);
+      }
+    }
 
-    // Ajoute le message user à l'historique
-    pushHistory(conversationId, "user", String(message));
+    const sys = buildSystemPrompt();
+    const task = buildTaskPrompt(mode, draftSafe, theme);
+    const convo = sanitizeMessages(messages);
 
-    const input = [
-      { role: "system", content: SYSTEM_BASE },
-      ...history.map((m) => ({ role: m.role, content: m.content })),
-      { role: "user", content: String(message) },
+    // Contexte (site + web)
+    const ctx = formatContext(siteContext, webResults);
+
+    const inputMessages = [
+      { role: "system", content: sys },
+      ...(ctx ? [{ role: "system", content: ctx }] : []),
     ];
 
-    const r = await client.responses.create({
-      model: "gpt-5-mini",
-      input,
-    });
-
-    const answer = r.output_text || "";
-    pushHistory(conversationId, "assistant", answer);
-
-    res.json({ text: answer, conversationId: conversationId || null });
-  } catch (e) {
-    console.error("chat error:", e?.message || e);
-    res.status(500).json({ error: "chat failed" });
-  }
-});
-
-// 4) Recherche (simple): renvoie des résultats KB + option “réponse IA”
-app.post("/search", requireAuth, async (req, res) => {
-  try {
-    const { query, aiAnswer } = req.body || {};
-    const results = simpleSearch(query);
-
-    if (!aiAnswer) {
-      return res.json({ results });
-    }
-
-    const context = results.map((r) => `- ${r.title}: ${r.text}`).join("\n");
-    const prompt = `Question: ${query || ""}
-
-Contexte (si utile):
-${context || "(aucun résultat)"}
-
-Réponds clairement en 6-10 lignes max.`;
-
-    const r = await client.responses.create({
-      model: "gpt-5-mini",
-      input: [
-        { role: "system", content: SYSTEM_BASE },
-        { role: "user", content: prompt },
-      ],
-    });
-
-    res.json({ results, answer: r.output_text });
-  } catch (e) {
-    console.error("search error:", e?.message || e);
-    res.status(500).json({ error: "search failed" });
-  }
-});
-
-// 5) Génération libre (texte long, article, page À propos, etc.)
-app.post("/generate", requireAuth, async (req, res) => {
-  try {
-    const { instruction } = req.body || {};
-    if (!instruction || !String(instruction).trim()) {
-      return res.status(400).json({ error: "instruction missing" });
-    }
-
-    const r = await client.responses.create({
-      model: "gpt-5-mini",
-      input: [
-        { role: "system", content: SYSTEM_BASE },
-        { role: "user", content: String(instruction) },
-      ],
-    });
-
-    res.json({ text: r.output_text });
-  } catch (e) {
-    console.error("generate error:", e?.message || e);
-    res.status(500).json({ error: "generate failed" });
-  }
-});
-
-// --- Start ---
-const port = process.env.PORT || 3000;
-app.post("/post-assist", requireAuth, async (req, res) => {
-  try {
-    const { mode, theme, draft } = req.body || {};
-
-    const system =
-      "Tu es l’assistant de contenu d’OlympeUS. Ton ton est chaleureux, neutre, respectueux. Tu tutoies. Réponds en français. Sois concret.";
-
-    let userPrompt = "";
-
-    if (mode === "ideas") {
-      userPrompt = `Donne 5 idées de publication pour OlympeUS sur le thème: ${theme || "général"}.
-Format: liste numérotée. Chaque idée = un titre + 1 phrase de pitch.`;
-    } else if (mode === "summary") {
-      userPrompt = `Résume ce texte en 5 points max:\n\n${draft || ""}`;
+    // Pour le mode chat, on injecte l’historique, sinon on fait simple
+    if (mode === "chat" && convo.length) {
+      inputMessages.push(...convo);
+      // Si le dernier message n'est pas déjà celui du draft, on l'ajoute
+      if (draftSafe && convo[convo.length - 1]?.content !== draftSafe) {
+        inputMessages.push({ role: "user", content: draftSafe });
+      }
     } else {
-      // improve (par défaut)
-      userPrompt = `Réécris ce texte pour qu’il soit plus clair, agréable et structuré, sans changer le sens.
-Ajoute un titre si pertinent.\n\nTexte:\n${draft || ""}`;
+      inputMessages.push({ role: "user", content: task });
+    }
+
+    if (!OPENAI_API_KEY) {
+      return res.status(500).json({ error: "OPENAI_API_KEY manquant côté Render." });
     }
 
     const r = await client.responses.create({
-      model: "gpt-4.1-mini",
-      input: [
-        { role: "system", content: system },
-        { role: "user", content: userPrompt }
-      ]
+      model: MODEL,
+      input: inputMessages,
     });
 
-    res.json({ text: r.output_text });
+    const text = r.output_text || "";
+
+    return res.json({
+      text,
+      web_results: webResults,
+    });
   } catch (e) {
     console.error("post-assist error:", e);
-    res.status(500).json({ error: "post-assist failed" });
+    return res.status(500).json({ error: "post-assist failed" });
   }
 });
 
+const port = process.env.PORT || 3000;
 app.listen(port, () => console.log("Serveur lancé sur le port", port));
-app.get("/test-ai", async (req, res) => {
-  try {
-    const response = await client.responses.create({
-      model: "gpt-4.1-mini",
-      input: "Dis simplement : L’IA fonctionne correctement."
-    });
-
-    res.json({
-      ok: true,
-      result: response.output_text
-    });
-  } catch (error) {
-    console.error("TEST AI ERROR:", error);
-    res.status(500).json({
-      ok: false,
-      error: error.message
-    });
-  }
-});
-
-
-
-
