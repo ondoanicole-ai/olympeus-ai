@@ -262,6 +262,41 @@ app.post("/generate", requireAuth, async (req, res) => {
 
 // --- Start ---
 const port = process.env.PORT || 3000;
+app.post("/post-assist", requireAuth, async (req, res) => {
+  try {
+    const { mode, theme, draft } = req.body || {};
+
+    const system =
+      "Tu es l’assistant de contenu d’OlympeUS. Ton ton est chaleureux, neutre, respectueux. Tu tutoies. Réponds en français. Sois concret.";
+
+    let userPrompt = "";
+
+    if (mode === "ideas") {
+      userPrompt = `Donne 5 idées de publication pour OlympeUS sur le thème: ${theme || "général"}.
+Format: liste numérotée. Chaque idée = un titre + 1 phrase de pitch.`;
+    } else if (mode === "summary") {
+      userPrompt = `Résume ce texte en 5 points max:\n\n${draft || ""}`;
+    } else {
+      // improve (par défaut)
+      userPrompt = `Réécris ce texte pour qu’il soit plus clair, agréable et structuré, sans changer le sens.
+Ajoute un titre si pertinent.\n\nTexte:\n${draft || ""}`;
+    }
+
+    const r = await client.responses.create({
+      model: "gpt-4.1-mini",
+      input: [
+        { role: "system", content: system },
+        { role: "user", content: userPrompt }
+      ]
+    });
+
+    res.json({ text: r.output_text });
+  } catch (e) {
+    console.error("post-assist error:", e);
+    res.status(500).json({ error: "post-assist failed" });
+  }
+});
+
 app.listen(port, () => console.log("Serveur lancé sur le port", port));
 app.get("/test-ai", async (req, res) => {
   try {
@@ -282,4 +317,5 @@ app.get("/test-ai", async (req, res) => {
     });
   }
 });
+
 
