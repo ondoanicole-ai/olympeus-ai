@@ -263,3 +263,23 @@ app.post("/generate", requireAuth, async (req, res) => {
 // --- Start ---
 const port = process.env.PORT || 3000;
 app.listen(port, () => console.log("Serveur lancé sur le port", port));
+app.get("/test-ai", async (req, res) => {
+  try {
+    const response = await client.responses.create({
+      model: "gpt-4.1-mini",
+      input: "Dis simplement : L’IA fonctionne correctement."
+    });
+
+    res.json({
+      ok: true,
+      result: response.output_text
+    });
+  } catch (error) {
+    console.error("TEST AI ERROR:", error);
+    res.status(500).json({
+      ok: false,
+      error: error.message
+    });
+  }
+});
+
