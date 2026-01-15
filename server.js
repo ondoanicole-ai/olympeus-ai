@@ -174,16 +174,60 @@ app.get("/", (req, res) => res.send("OlympeUS AI API is running ✅"));
 
 app.post("/post-assist", requireAuth, async (req, res) => {
   try {
-    const {
-      mode = "chat",
-      draft = "",
-      theme = "OlympeUS",
-      messages = [],
-      siteContext = [],
-      moderation = true,
-      webSearch = false,
-      webQuery = "",
-    } = req.body || {};
+    const { mode, theme, draft, messages } = req.body || {};
+
+    // 1) On accepte soit messages (chat multi-tours), soit draft (1 tour)
+    const hasMessages = Array.isArray(messages) && messages.length > 0;
+    const userText = (draft || "").trim();
+
+    if (!hasMessages && !userText) {
+      return res.json({ text: "Écris-moi ta demande dans le champ en bas, puis clique Envoyer 🙂" });
+    }
+
+    // 2) Construction du prompt selon le mode
+    const system = `Tu es OlympeUS. Ton ton est chaleureux, neutre, et tu tutoies.`;
+
+    let inputMessages;
+
+    if (mode === "chat") {
+      inputMessages = [
+        { role: "system", content: system },
+        ...(hasMessages
+          ? messages
+          : [{ role: "user", content: userText }])
+      ];
+    } else if (mode === "ideas") {
+      inputMessages = [
+        { role: "system", content: system },
+        { role: "user", content: `Donne 5 idées de publication sur: ${theme || "OlympeUS"}.` }
+      ];
+    } else if (mode === "improve") {
+      inputMessages = [
+        { role: "system", content: system },
+        { role: "user", content: `Améliore ce texte (sans changer le sens) :\n${userText}` }
+      ];
+    } else if (mode === "summary") {
+      inputMessages = [
+        { role: "system", content: system },
+        { role: "user", content: `Résume ce texte :\n${userText}` }
+      ];
+    } else {
+      inputMessages = [
+        { role: "system", content: system },
+        { role: "user", content: userText || "Dis bonjour." }
+      ];
+    }
+
+    const r = await client.responses.create({
+      model: "gpt-4.1-mini",
+      input: inputMessages
+    });
+
+    return res.json({ text: r.output_text });
+  } catch (e) {
+    return res.status(500).json({ error: "post-assist failed" });
+  }
+});
 
     const draftSafe = safeStr(draft, 6000);
 
@@ -251,3 +295,4 @@ app.post("/post-assist", requireAuth, async (req, res) => {
 
 const port = process.env.PORT || 3000;
 app.listen(port, () => console.log("Serveur lancé sur le port", port));
+
