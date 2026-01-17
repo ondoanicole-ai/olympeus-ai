@@ -8,62 +8,134 @@ const { Pool } = pg;
 
 const app = express();
 
-// -------------------- ENV --------------------
+// -------------------- ENV (avec fallbacks) --------------------
 const PORT = Number(process.env.PORT || 10000);
 const NODE_ENV = process.env.NODE_ENV || "production";
 
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY || "";
 
-const STRIPE_SECRET_KEY = process.env.STRIPE_SECRET_KEY || "";
-const STRIPE_WEBHOOK_SECRET = process.env.STRIPE_WEBHOOK_SECRET || "";
-const STRIPE_PRICE_PREMIUM = process.env.STRIPE_PRICE_PREMIUM || "";
-const STRIPE_PRICE_FREE = process.env.STRIPE_PRICE_FREE || ""; // optionnel
-
-const APP_SUCCESS_URL = process.env.APP_SUCCESS_URL || process.env.APP_SUCCES_URL || "";
-const APP_CANCEL_URL = process.env.APP_CANCEL_URL || "";
+const OLYMPEUS_SHARED_TOKEN = process.env.OLYMPEUS_SHARED_TOKEN || ""; // optionnel
 
 const DATABASE_URL = process.env.DATABASE_URL || "";
+
+const STRIPE_SECRET_KEY = process.env.STRIPE_SECRET_KEY || "";
+const STRIPE_WEBHOOK_SECRET = process.env.STRIPE_WEBHOOK_SECRET || "";
+
+// accepte les 2 noms (au cas où tu avais une typo)
+const STRIPE_PRICE_PREMIUM =
+  process.env.STRIPE_PRICE_PREMIUM ||
+  process.env.STRIPE_PRICE_PRENIUM ||
+  "";
+
+const STRIPE_PRICE_FREE = process.env.STRIPE_PRICE_FREE || ""; // optionnel
+
+const APP_SUCCESS_URL =
+  process.env.APP_SUCCESS_URL ||
+  process.env.APP_SUCCES_URL || // tolère la typo
+  "";
+
+const APP_CANCEL_URL = process.env.APP_CANCEL_URL || "";
+
 const TAVILY_API_KEY = process.env.TAVILY_API_KEY || "";
 
-// -------------------- SAFE BOOT (never crash) --------------------
-let stripe = null;
-try {
-  if (STRIPE_SECRET_KEY) {
-    stripe = new Stripe(STRIPE_SECRET_KEY, { apiVersion: "2023-10-16" });
-    console.log("✅ Stripe ready");
-  } else {
-    console.log("ℹ️ Stripe disabled (missing STRIPE_SECRET_KEY)");
-  }
-} catch (e) {
-  console.error("⚠️ Stripe init failed:", e?.message || e);
-  stripe = null;
-}
+// -------------------- CORE MIDDLEWARE --------------------
 
-let pool = null;
-try {
-  if (DATABASE_URL) {
-    pool = new Pool({
-      connectionString: DATABASE_URL,
-      ssl: NODE_ENV === "production" ? { rejectUnauthorized: false } : false,
-    });
-    console.log("✅ Postgres pool created");
-  } else {
-    console.log("ℹ️ Postgres disabled (missing DATABASE_URL)");
-  }
-} catch (e) {
-  console.error("⚠️ Postgres init failed:", e?.message || e);
-  pool = null;
-}
-
-// -------------------- MIDDLEWARE --------------------
-// Stripe webhook needs RAW body ONLY on that route:
+// Stripe webhook MUST have RAW body on that route
 app.post("/stripe/webhook", bodyParser.raw({ type: "application/json" }));
 
 app.use(cors({ origin: true, credentials: true }));
 app.use(express.json({ limit: "2mb" }));
 app.use(express.urlencoded({ extended: true }));
 
-// -------------------- HEALTH ROUTES (must never fail) --------------------
+// Auth optionnel : si token défini, on l’exige
+function optionalTokenGuard(req, res, next) {
+  if (!OLYMPEUS_SHARED_TOKEN) return next();
+  const t = req.headers["x-olympeus-token"];
+  if (!t || t !== OLYMPEUS_SHARED_TOKEN) {
+    return res.status(401).json({ ok: false, error: "unauthorized" });
+  }
+  next();
+}
+
+// -------------------- SAFE SERVICES (ne jamais crasher) --------------------
+let pool = null;
+async function initDb() {
+  if (!DATABASE_URL) {
+    console.log("ℹ️ DB disabled (DATABASE_URL missing)");
+    return null;
+  }
+  try {
+    const p = new Pool({
+      connectionString: DATABASE_URL,
+      ssl: NODE_ENV === "production" ? { rejectUnauthorized: false } : false,
+    });
+    await p.query("SELECT 1");
+    console.log("✅ DB connected");
+
+    // créer les tables nécessaires si elles n’existent pas (pour éviter erreurs)
+    await p.query(`
+      CREATE TABLE IF NOT EXISTS public.users (
+        id SERIAL PRIMARY KEY,
+        wp_user_id INTEGER UNIQUE NOT NULL,
+        role TEXT NOT NULL DEFAULT 'free',
+        subscription_status TEXT NOT NULL DEFAULT 'inactive',
+        stripe_customer_id TEXT,
+        created_at TIMESTAMP DEFAULT NOW()
+      );
+    `);
+
+    await p.query(`
+      CREATE TABLE IF NOT EXISTS public.ai_quotas (
+        role TEXT PRIMARY KEY,
+        chat_per_day INTEGER NOT NULL,
+        web_per_day INTEGER NOT NULL,
+        max_prompt_chars INTEGER NOT NULL
+      );
+    `);
+
+    await p.query(`
+      INSERT INTO public.ai_quotas(role, chat_per_day, web_per_day, max_prompt_chars)
+      VALUES ('free', 10, 3, 4000),
+             ('premium', 300, 50, 20000)
+      ON CONFLICT (role) DO NOTHING;
+    `);
+
+    await p.query(`
+      CREATE TABLE IF NOT EXISTS public.ai_usage_daily (
+        id SERIAL PRIMARY KEY,
+        wp_user_id INTEGER NOT NULL,
+        day DATE NOT NULL,
+        chat_requests INTEGER NOT NULL DEFAULT 0,
+        web_requests INTEGER NOT NULL DEFAULT 0,
+        tokens INTEGER NOT NULL DEFAULT 0,
+        UNIQUE (wp_user_id, day)
+      );
+    `);
+
+    return p;
+  } catch (e) {
+    console.error("⚠️ DB init failed (disabled):", e?.message || e);
+    return null;
+  }
+}
+
+let stripe = null;
+function initStripe() {
+  if (!STRIPE_SECRET_KEY) {
+    console.log("ℹ️ Stripe disabled (STRIPE_SECRET_KEY missing)");
+    return null;
+  }
+  try {
+    const s = new Stripe(STRIPE_SECRET_KEY, { apiVersion: "2023-10-16" });
+    console.log("✅ Stripe ready");
+    return s;
+  } catch (e) {
+    console.error("⚠️ Stripe init failed (disabled):", e?.message || e);
+    return null;
+  }
+}
+
+// -------------------- HEALTH ROUTES (jamais de 502) --------------------
 app.get("/", (req, res) => res.status(200).send("OlympeUS API ✅"));
 app.get("/ping", (req, res) => res.status(200).json({ ok: true }));
 app.get("/health", async (req, res) => {
@@ -84,33 +156,84 @@ app.get("/health", async (req, res) => {
   });
 });
 
-// -------------------- HELPERS --------------------
-function safe(res, code, obj) {
-  try {
-    return res.status(code).json(obj);
-  } catch {
-    return res.status(code).send("OK");
-  }
+// -------------------- QUOTA HELPERS --------------------
+async function ensureUser(wp_user_id) {
+  if (!pool) return { role: "free" };
+
+  await pool.query(
+    `INSERT INTO public.users (wp_user_id, role, subscription_status)
+     VALUES ($1,'free','inactive')
+     ON CONFLICT (wp_user_id) DO NOTHING`,
+    [Number(wp_user_id)]
+  );
+
+  const r = await pool.query(
+    `SELECT role, subscription_status, stripe_customer_id
+     FROM public.users
+     WHERE wp_user_id=$1
+     LIMIT 1`,
+    [Number(wp_user_id)]
+  );
+  return r.rows?.[0] || { role: "free" };
 }
 
-async function getUserRole(wp_user_id) {
-  // fallback = free si pas de DB
-  if (!pool || !wp_user_id) return "free";
-  try {
-    await pool.query(
-      `INSERT INTO users (wp_user_id, role, subscription_status)
-       VALUES ($1,'free','inactive')
-       ON CONFLICT (wp_user_id) DO NOTHING`,
-      [Number(wp_user_id)]
-    );
-    const r = await pool.query(`SELECT role FROM users WHERE wp_user_id=$1 LIMIT 1`, [Number(wp_user_id)]);
-    return r.rows?.[0]?.role || "free";
-  } catch (e) {
-    console.error("getUserRole error:", e?.message || e);
-    return "free";
+async function getQuotas(role) {
+  if (!pool) {
+    return role === "premium"
+      ? { chat_per_day: 300, web_per_day: 50, max_prompt_chars: 20000 }
+      : { chat_per_day: 10, web_per_day: 3, max_prompt_chars: 4000 };
   }
+  const r = await pool.query(
+    `SELECT chat_per_day, web_per_day, max_prompt_chars FROM public.ai_quotas WHERE role=$1 LIMIT 1`,
+    [role]
+  );
+  if (r.rows?.[0]) return r.rows[0];
+  return role === "premium"
+    ? { chat_per_day: 300, web_per_day: 50, max_prompt_chars: 20000 }
+    : { chat_per_day: 10, web_per_day: 3, max_prompt_chars: 4000 };
 }
 
+async function getTodayUsage(wp_user_id) {
+  if (!pool) return { chat_requests: 0, web_requests: 0, tokens: 0 };
+
+  await pool.query(
+    `INSERT INTO public.ai_usage_daily (wp_user_id, day, chat_requests, web_requests, tokens)
+     VALUES ($1, CURRENT_DATE, 0, 0, 0)
+     ON CONFLICT (wp_user_id, day) DO NOTHING`,
+    [Number(wp_user_id)]
+  );
+
+  const r = await pool.query(
+    `SELECT chat_requests, web_requests, tokens
+     FROM public.ai_usage_daily
+     WHERE wp_user_id=$1 AND day=CURRENT_DATE`,
+    [Number(wp_user_id)]
+  );
+  return r.rows?.[0] || { chat_requests: 0, web_requests: 0, tokens: 0 };
+}
+
+async function incChat(wp_user_id, tokens) {
+  if (!pool) return;
+  await pool.query(
+    `UPDATE public.ai_usage_daily
+     SET chat_requests = chat_requests + 1,
+         tokens = tokens + $2
+     WHERE wp_user_id=$1 AND day=CURRENT_DATE`,
+    [Number(wp_user_id), Number(tokens || 0)]
+  );
+}
+
+async function incWeb(wp_user_id) {
+  if (!pool) return;
+  await pool.query(
+    `UPDATE public.ai_usage_daily
+     SET web_requests = web_requests + 1
+     WHERE wp_user_id=$1 AND day=CURRENT_DATE`,
+    [Number(wp_user_id)]
+  );
+}
+
+// -------------------- TAVILY (only if enabled) --------------------
 async function tavilySearch(query) {
   if (!TAVILY_API_KEY) return { used: false, results: [] };
   try {
@@ -140,6 +263,7 @@ async function tavilySearch(query) {
   }
 }
 
+// -------------------- OPENAI (via HTTP, pas de lib) --------------------
 async function callOpenAI({ prompt, expert, webContext }) {
   if (!OPENAI_API_KEY) {
     return { text: "Erreur serveur : OPENAI_API_KEY manquante.", tokens: 0 };
@@ -148,8 +272,10 @@ async function callOpenAI({ prompt, expert, webContext }) {
   const system = [
     "Tu es OlympeUS, assistant francophone.",
     "Tu tutoies, ton chaleureux et neutre.",
-    "Tu n'inventes jamais. Si tu ne sais pas, dis-le.",
-    expert ? "MODE EXPERT : réponse structurée, étapes, recommandations concrètes." : "Réponse simple, utile et lisible.",
+    "Tu n'inventes jamais : si tu ne sais pas, dis-le.",
+    expert
+      ? "MODE EXPERT : réponse structurée, étapes, recommandations concrètes."
+      : "Réponse simple, utile et lisible.",
   ].join("\n");
 
   const messages = [
@@ -175,7 +301,6 @@ async function callOpenAI({ prompt, expert, webContext }) {
     const txt = await resp.text().catch(() => "");
     throw new Error(`OpenAI HTTP ${resp.status}: ${txt}`);
   }
-
   const data = await resp.json();
   return {
     text: data?.choices?.[0]?.message?.content?.trim() || "",
@@ -184,14 +309,14 @@ async function callOpenAI({ prompt, expert, webContext }) {
 }
 
 // -------------------- STRIPE: CHECKOUT --------------------
-app.post("/stripe/create-checkout-session", async (req, res) => {
+app.post("/stripe/create-checkout-session", optionalTokenGuard, async (req, res) => {
   try {
-    if (!stripe) return safe(res, 400, { error: "Stripe not configured" });
-    if (!STRIPE_PRICE_PREMIUM) return safe(res, 400, { error: "Missing STRIPE_PRICE_PREMIUM" });
-    if (!APP_SUCCESS_URL || !APP_CANCEL_URL) return safe(res, 400, { error: "Missing APP_SUCCESS_URL / APP_CANCEL_URL" });
+    if (!stripe) return res.status(400).json({ ok: false, error: "stripe_not_configured" });
+    if (!STRIPE_PRICE_PREMIUM) return res.status(400).json({ ok: false, error: "missing_STRIPE_PRICE_PREMIUM" });
+    if (!APP_SUCCESS_URL || !APP_CANCEL_URL) return res.status(400).json({ ok: false, error: "missing_success_or_cancel_url" });
 
     const { wp_user_id } = req.body || {};
-    if (!wp_user_id) return safe(res, 400, { error: "wp_user_id missing" });
+    if (!wp_user_id) return res.status(400).json({ ok: false, error: "wp_user_id_missing" });
 
     const session = await stripe.checkout.sessions.create({
       mode: "subscription",
@@ -203,18 +328,18 @@ app.post("/stripe/create-checkout-session", async (req, res) => {
       allow_promotion_codes: true,
     });
 
-    return safe(res, 200, { url: session.url, id: session.id });
+    res.json({ ok: true, url: session.url, id: session.id });
   } catch (e) {
-    console.error("checkout error:", e?.message || e);
-    return safe(res, 500, { error: "stripe_checkout_failed" });
+    console.error("stripe checkout error:", e?.message || e);
+    res.status(500).json({ ok: false, error: "stripe_checkout_failed" });
   }
 });
 
-// -------------------- STRIPE: WEBHOOK --------------------
+// -------------------- STRIPE: WEBHOOK (upgrade premium) --------------------
 app.post("/stripe/webhook", async (req, res) => {
   try {
-    if (!stripe) return safe(res, 200, { ok: true, stripe: "disabled" });
-    if (!STRIPE_WEBHOOK_SECRET) return safe(res, 400, { error: "Missing STRIPE_WEBHOOK_SECRET" });
+    if (!stripe) return res.status(200).json({ received: true, stripe: "disabled" });
+    if (!STRIPE_WEBHOOK_SECRET) return res.status(400).send("Missing STRIPE_WEBHOOK_SECRET");
 
     const sig = req.headers["stripe-signature"];
     let event;
@@ -225,225 +350,137 @@ app.post("/stripe/webhook", async (req, res) => {
       return res.status(400).send("Webhook signature error");
     }
 
-    // Upgrade/downgrade user role via wp_user_id in metadata or client_reference_id
-    if (pool) {
-      try {
-        if (event.type === "checkout.session.completed") {
-          const session = event.data.object;
-          const wpUser = session?.metadata?.wp_user_id || session?.client_reference_id;
-          if (wpUser) {
-            await pool.query(
-              `INSERT INTO users (wp_user_id, role, subscription_status, stripe_customer_id)
-               VALUES ($1,'premium','active',$2)
-               ON CONFLICT (wp_user_id) DO UPDATE SET role='premium', subscription_status='active', stripe_customer_id=EXCLUDED.stripe_customer_id`,
-              [Number(wpUser), session.customer || null]
-            );
-          }
-        }
+    // Activer premium
+    if (pool && event.type === "checkout.session.completed") {
+      const session = event.data.object;
+      const wpUser = session?.metadata?.wp_user_id || session?.client_reference_id;
+      const customerId = session?.customer || null;
 
-        if (event.type === "customer.subscription.deleted") {
-          const sub = event.data.object;
-          // On ne sait pas toujours le wp_user_id ici: pour du full robuste, on map via stripe_customer_id.
-          if (sub.customer) {
-            await pool.query(
-              `UPDATE users SET role='free', subscription_status='canceled'
-               WHERE stripe_customer_id=$1`,
-              [sub.customer]
-            );
-          }
-        }
-      } catch (e) {
-        console.error("webhook db update error:", e?.message || e);
-        // On répond OK à Stripe quand même pour éviter les retries infinis
+      if (wpUser) {
+        await pool.query(
+          `INSERT INTO public.users (wp_user_id, role, subscription_status, stripe_customer_id)
+           VALUES ($1,'premium','active',$2)
+           ON CONFLICT (wp_user_id)
+           DO UPDATE SET role='premium', subscription_status='active', stripe_customer_id=EXCLUDED.stripe_customer_id`,
+          [Number(wpUser), customerId]
+        );
+      }
+    }
+
+    // Downgrade si abonnement supprimé (si on peut mapper via customer)
+    if (pool && event.type === "customer.subscription.deleted") {
+      const sub = event.data.object;
+      const customerId = sub?.customer;
+      if (customerId) {
+        await pool.query(
+          `UPDATE public.users SET role='free', subscription_status='canceled'
+           WHERE stripe_customer_id=$1`,
+          [customerId]
+        );
       }
     }
 
     console.log("✅ webhook:", event.type);
-    return safe(res, 200, { received: true });
+    return res.status(200).json({ received: true });
   } catch (e) {
     console.error("webhook error:", e?.message || e);
-    return safe(res, 200, { received: true }); // ne pas faire échouer Stripe
+    // Important: répondre 200 pour éviter les retries infinis Stripe
+    return res.status(200).json({ received: true, ok: false });
   }
 });
 
-// -------------------- AI ENDPOINT --------------------
-app.post("/post-assist", async (req, res) => {
+// -------------------- AI: quotas + web optional + tracking --------------------
+async function handleAssist(req, res) {
   try {
-    const { prompt, wp_user_id, expert = false, web = { enabled: false, query: "" } } = req.body || {};
-    if (!prompt || String(prompt).trim().length === 0) return safe(res, 400, { error: "prompt missing" });
-    if (!wp_user_id) return safe(res, 400, { error: "wp_user_id missing" });
+    const { wp_user_id, prompt, expert = false, web = { enabled: false, query: "" } } = req.body || {};
 
-    // ----- 1) Récupérer rôle + quotas -----
-    let role = "free";
-    let quotas = { chat_per_day: 10, web_per_day: 3, max_prompt_chars: 4000 };
+    if (!wp_user_id) return res.status(400).json({ ok: false, error: "wp_user_id_missing" });
+    if (!prompt || String(prompt).trim().length === 0) return res.status(400).json({ ok: false, error: "prompt_missing" });
 
-    if (pool) {
-      // user row
-      await pool.query(
-        `INSERT INTO users (wp_user_id, role, subscription_status)
-         VALUES ($1,'free','inactive')
-         ON CONFLICT (wp_user_id) DO NOTHING`,
-        [Number(wp_user_id)]
-      );
+    const user = await ensureUser(wp_user_id);
+    const role = user?.role || "free";
+    const quotas = await getQuotas(role);
 
-      const rRole = await pool.query(`SELECT role FROM users WHERE wp_user_id=$1 LIMIT 1`, [Number(wp_user_id)]);
-      role = rRole.rows?.[0]?.role || "free";
-
-      const rQ = await pool.query(`SELECT chat_per_day, web_per_day, max_prompt_chars FROM ai_quotas WHERE role=$1`, [
-        role,
-      ]);
-      if (rQ.rows?.[0]) quotas = rQ.rows[0];
-    }
-
-    // ----- 2) Vérifier limites prompt -----
     const p = String(prompt);
     if (p.length > Number(quotas.max_prompt_chars)) {
-      return safe(res, 429, {
-        error: `Limite free/premium atteinte : texte trop long (${p.length} caractères).`,
+      return res.status(429).json({
+        ok: false,
+        error: "prompt_too_long",
+        message: `Texte trop long (${p.length}). Limite: ${quotas.max_prompt_chars}.`,
+        role,
       });
     }
 
-    // ----- 3) Compter usage du jour + bloquer si quota dépassé -----
-    let todayUsage = { chat_requests: 0, web_requests: 0, tokens: 0 };
-
-    if (pool) {
-      await pool.query(
-        `INSERT INTO ai_usage_daily (wp_user_id, day, chat_requests, web_requests, tokens)
-         VALUES ($1, CURRENT_DATE, 0, 0, 0)
-         ON CONFLICT (wp_user_id, day) DO NOTHING`,
-        [Number(wp_user_id)]
-      );
-
-      const rU = await pool.query(
-        `SELECT chat_requests, web_requests, tokens
-         FROM ai_usage_daily
-         WHERE wp_user_id=$1 AND day=CURRENT_DATE`,
-        [Number(wp_user_id)]
-      );
-      if (rU.rows?.[0]) todayUsage = rU.rows[0];
-
-      if (Number(todayUsage.chat_requests) >= Number(quotas.chat_per_day)) {
-        return safe(res, 429, {
-          error: `Quota journalier atteint (${quotas.chat_per_day} requêtes/jour). Passe Premium pour augmenter tes limites.`,
-          role,
-          quota: { ...quotas, used: todayUsage },
-        });
-      }
-    } else {
-      // Sans DB, on ne peut pas compter : on laisse passer (mais tu as la DB donc OK)
+    const usage = await getTodayUsage(wp_user_id);
+    if (Number(usage.chat_requests) >= Number(quotas.chat_per_day)) {
+      return res.status(429).json({
+        ok: false,
+        error: "quota_reached",
+        message: `Quota atteint (${quotas.chat_per_day}/jour). Passe Premium pour augmenter tes limites.`,
+        role,
+        quota: { ...quotas, used: usage },
+      });
     }
 
-    // ----- 4) Tavily uniquement si demandé ET quota web ok -----
+    // Web search only if enabled AND query ok AND web quota ok
+    const wantWeb =
+      Boolean(web?.enabled) && String(web?.query || "").trim().length >= 3;
+
     let citations = [];
     let webContext = "";
-    const wantWeb = Boolean(web?.enabled) && String(web?.query || "").trim().length >= 3;
 
-    if (wantWeb) {
-      if (pool && Number(todayUsage.web_requests) >= Number(quotas.web_per_day)) {
-        // On n’échoue pas l’IA : on désactive juste le web
-        // (comme ça l’utilisateur a une réponse quand même)
-      } else {
-        const t = await tavilySearch(String(web.query));
-        if (t.used && t.results.length) {
-          citations = t.results.map((r, i) => ({ id: i + 1, title: r.title, url: r.url }));
-          const blocks = t.results
-            .map((r, i) => `[${i + 1}] ${r.title}\nURL: ${r.url}\nExtrait: ${r.content}`)
-            .join("\n\n");
-          webContext =
-            `Contexte web (si utile, sinon ignore). ` +
-            `Si tu t'appuies dessus, cite [1], [2], etc.\n\n${blocks}`;
-        }
+    if (wantWeb && Number(usage.web_requests) < Number(quotas.web_per_day)) {
+      const t = await tavilySearch(String(web.query));
+      await incWeb(wp_user_id);
 
-        // incrémente web_requests si on a tenté une recherche
-        if (pool) {
-          await pool.query(
-            `UPDATE ai_usage_daily
-             SET web_requests = web_requests + 1
-             WHERE wp_user_id=$1 AND day=CURRENT_DATE`,
-            [Number(wp_user_id)]
-          );
-        }
+      if (t.used && t.results.length) {
+        citations = t.results.map((r, i) => ({ id: i + 1, title: r.title, url: r.url }));
+        const blocks = t.results
+          .map((r, i) => `[${i + 1}] ${r.title}\nURL: ${r.url}\nExtrait: ${r.content}`)
+          .join("\n\n");
+        webContext =
+          `Contexte web (si utile, sinon ignore). ` +
+          `Si tu t'appuies dessus, cite [1], [2], etc.\n\n${blocks}`;
       }
     }
 
-    // ----- 5) Appel OpenAI -----
     const { text, tokens } = await callOpenAI({
       prompt: p,
       expert: Boolean(expert),
       webContext,
     });
 
-    // ----- 6) Incrémenter chat_requests + tokens -----
-    if (pool) {
-      await pool.query(
-        `UPDATE ai_usage_daily
-         SET chat_requests = chat_requests + 1,
-             tokens = tokens + $2
-         WHERE wp_user_id=$1 AND day=CURRENT_DATE`,
-        [Number(wp_user_id), Number(tokens || 0)]
-      );
-    }
+    await incChat(wp_user_id, tokens);
 
-    return safe(res, 200, {
-      ok: true,
-      role,
-      answer: text,
-      citations,
-      quota: {
-        ...quotas,
-        used: pool
-          ? {
-              chat_requests: Number(todayUsage.chat_requests) + 1,
-              web_requests: Number(todayUsage.web_requests) + (wantWeb ? 1 : 0),
-              tokens: Number(todayUsage.tokens) + Number(tokens || 0),
-            }
-          : null,
-      },
-    });
-  } catch (e) {
-    console.error("post-assist error:", e?.message || e);
-    return safe(res, 500, { error: "post-assist-failed" });
-  }
-});
-
-    // Tavily uniquement si demandé
-    let citations = [];
-    let webContext = "";
-    const wantWeb = Boolean(web?.enabled) && String(web?.query || "").trim().length >= 3;
-
-    if (wantWeb) {
-      const t = await tavilySearch(String(web.query));
-      if (t.used && t.results.length) {
-        citations = t.results.map((r, i) => ({ id: i + 1, title: r.title, url: r.url }));
-        const blocks = t.results
-          .map((r, i) => `[${i + 1}] ${r.title}\nURL: ${r.url}\nExtrait: ${r.content}`)
-          .join("\n\n");
-        webContext = `Contexte web (si utile, sinon ignore). Si tu t'appuies dessus, cite [1], [2], etc.\n\n${blocks}`;
-      }
-    }
-
-    const { text } = await callOpenAI({
-      prompt: String(prompt),
-      expert: Boolean(expert),
-      webContext,
-    });
-
-    return safe(res, 200, {
+    return res.status(200).json({
       ok: true,
       role,
       answer: text,
       citations,
     });
   } catch (e) {
-    console.error("post-assist error:", e?.message || e);
-    return safe(res, 500, { error: "post-assist-failed" });
+    console.error("assist error:", e?.message || e);
+    return res.status(500).json({ ok: false, error: "post-assist-failed" });
   }
-});
+}
 
-// -------------------- 404 --------------------
-app.use((req, res) => safe(res, 404, { error: "not_found" }));
+// L’endpoint principal + alias (selon ton snippet)
+app.post("/post-assist", optionalTokenGuard, handleAssist);
+app.post("/com-post-assist", optionalTokenGuard, handleAssist);
+
+// -------------------- 404 + ERROR HANDLER --------------------
+app.use((req, res) => res.status(404).json({ ok: false, error: "not_found" }));
+app.use((err, req, res, next) => {
+  console.error("UNHANDLED:", err?.message || err);
+  res.status(500).json({ ok: false, error: "server_error" });
+});
 
 // -------------------- START --------------------
-app.listen(PORT, "0.0.0.0", () => {
-  console.log(`✅ Server running on port ${PORT}`);
-});
+(async () => {
+  pool = await initDb();
+  stripe = initStripe();
+
+  app.listen(PORT, "0.0.0.0", () => {
+    console.log(`✅ Server running on port ${PORT}`);
+  });
+})();
