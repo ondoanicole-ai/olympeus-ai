@@ -284,18 +284,18 @@ async function callOpenAI({ prompt, expert, webContext }) {
     { role: "user", content: prompt },
   ];
 
-  const resp = await fetch("https://api.openai.com/v1/chat/completions", {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${OPENAI_API_KEY}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({
-      model: "gpt-4.1-mini",
-      temperature: expert ? 0.25 : 0.7,
-      messages,
-    }),
-  });
+  const res = await fetch(ENDPOINT, {
+  method: 'POST',
+  headers: {
+    'Content-Type': 'application/json',
+    'X-WP-Nonce': window.wpApiSettings.nonce
+  },
+  body: JSON.stringify({
+    prompt,
+    expert: !!expertEl.checked,
+    web_enabled: !!webEl.checked
+  })
+});
 
   if (!resp.ok) {
     const txt = await resp.text().catch(() => "");
@@ -484,3 +484,4 @@ app.use((err, req, res, next) => {
     console.log(`✅ Server running on port ${PORT}`);
   });
 })();
+
