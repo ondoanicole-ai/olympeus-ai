@@ -6,7 +6,7 @@ document.addEventListener("DOMContentLoaded", () => {
   const expertCheckbox = document.getElementById("olympeus-expert");
 
   if (!form || !input || !messages) {
-    console.error("Olympeus AI: éléments manquants dans le DOM");
+    console.error("Olympeus AI: éléments manquants");
     return;
   }
 
@@ -24,8 +24,8 @@ document.addEventListener("DOMContentLoaded", () => {
     addMessage(message, "user");
 
     const payload = {
-      message: message,
-      conversationId: conversationId,
+      message,
+      conversationId,
       expert: !!expertCheckbox?.checked,
       web: {
         enabled: !!webCheckbox?.checked,
@@ -34,43 +34,47 @@ document.addEventListener("DOMContentLoaded", () => {
     };
 
     try {
-      const response = await fetch("/wp-json/olympeus/v1/chat", {
+      const wp = window.OLYMPEUS_WP || {};
+      const endpoint = (wp.rest ? wp.rest : "/wp-json/") + "olympeus/v1/chat";
+
+      const res = await fetch(endpoint, {
         method: "POST",
 
-        // 🔥 CORRECTIF CRITIQUE 401
-        // On empêche WordPress d’envoyer les cookies (sinon nonce exigé)
-        credentials: "omit",
+        // ✅ ON GARDE LES COOKIES WP (sinon WP ne reconnait pas l'utilisateur)
+        credentials: "same-origin",
 
         headers: {
-          "Content-Type": "application/json"
+          "Content-Type": "application/json",
+          // ✅ NONCE VALIDE (injecté par le snippet PHP)
+          ...(wp.nonce ? { "X-WP-Nonce": wp.nonce } : {})
         },
+
         body: JSON.stringify(payload)
       });
 
-      if (!response.ok) {
-        const text = await response.text();
-        throw new Error(`Erreur API (${response.status}) : ${text}`);
+      if (!res.ok) {
+        const text = await res.text();
+        throw new Error(`API ${res.status}: ${text}`);
       }
 
-      const data = await response.json();
+      const data = await res.json();
 
-      if (data.conversationId) {
-        conversationId = data.conversationId;
-      }
+      if (data.conversationId) conversationId = data.conversationId;
 
       addMessage(data.answer || "Réponse vide.", "assistant");
-
     } catch (err) {
-      console.error("Olympeus AI error:", err);
-      addMessage("❌ Erreur API. Veuillez réessayer.", "error");
+      console.error("Olympeus AI:", err);
+      addMessage("❌ Erreur API. Vérifie les logs Render/WP.", "error");
     }
   }
 
   form.addEventListener("submit", (e) => {
     e.preventDefault();
-    const message = input.value.trim();
-    if (!message) return;
+    const msg = input.value.trim();
+    if (!msg) return;
     input.value = "";
-    sendMessage(message);
+    sendMessage(msg);
   });
 });
+
+
