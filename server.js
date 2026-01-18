@@ -3,68 +3,89 @@ import cors from "cors";
 
 const app = express();
 
-// --- Middlewares
+/* =========================
+   CONFIG
+========================= */
+
+const PORT = process.env.PORT || 10000;
+const SHARED_TOKEN = process.env.OLYMPEUS_SHARED_TOKEN || "";
+
+/* =========================
+   MIDDLEWARES
+========================= */
+
 app.use(cors());
 app.use(express.json({ limit: "1mb" }));
 
-// --- Config
-const PORT = Number(process.env.PORT || 10000);
-const ADMIN_TOKEN = process.env.ADMIN_TOKEN || "";
-const OLYMPEUS_SHARED_TOKEN = process.env.OLYMPEUS_SHARED_TOKEN || "";
+/* =========================
+   HEALTH CHECK
+========================= */
 
-// --- Helpers
-function requireBearerToken(expected) {
-  return (req, res, next) => {
-    if (!expected) return res.status(500).json({ ok: false, error: "Server token not configured" });
-
-    const auth = req.headers.authorization || "";
-    const token = auth.startsWith("Bearer ") ? auth.slice(7) : "";
-    if (token !== expected) return res.status(401).json({ ok: false, error: "Unauthorized" });
-    next();
-  };
-}
-
-// --- Routes
 app.get("/", (req, res) => {
-  res.status(200).send("Olympeus API OK");
+  res.json({
+    ok: true,
+    service: "olympeus-ai",
+    status: "running"
+  });
 });
 
-app.get("/ping", (req, res) => {
-  res.status(200).json({ ok: true, pong: true });
-});
+/* =========================
+   POST /post-assist
+========================= */
 
-app.get("/health", (req, res) => {
-  res.status(200).json({ ok: true, status: "healthy" });
-});
-
-// Endpoint appelé par WordPress (bridge)
-app.post("/post-assist", requireBearerToken(OLYMPEUS_SHARED_TOKEN), async (req, res) => {
+app.post("/post-assist", async (req, res) => {
   try {
-    const { message, expert, web } = req.body || {};
-    if (!message || typeof message !== "string") {
-      return res.status(400).json({ ok: false, error: "Missing message" });
+    /* ---- 1. Vérif TOKEN ---- */
+    const token =
+      req.headers["x-olympeus-token"] ||
+      req.headers["authorization"] ||
+      "";
+
+    if (!SHARED_TOKEN) {
+      console.warn("⚠️ Aucun token configuré côté serveur");
     }
 
-    // TODO: ici tu mets l’appel OpenAI / Tavily / DB etc.
-    // Pour l’instant on répond juste pour valider toute la chaîne:
-    const answer = `✅ Reçu: "${message}" | expert=${!!expert} | web=${!!web?.enabled}`;
+    if (SHARED_TOKEN && token !== SHARED_TOKEN) {
+      console.warn("❌ Token invalide", { token });
+      return res.status(401).json({
+        ok: false,
+        error: "unauthorized"
+      });
+    }
 
-    return res.status(200).json({
+    /* ---- 2. Vérif payload ---- */
+    const { message, conversationId, expert, web } = req.body || {};
+
+    if (!message || typeof message !== "string") {
+      return res.status(400).json({
+        ok: false,
+        error: "missing_message"
+      });
+    }
+
+    /* ---- 3. Simulation IA (à remplacer plus tard) ---- */
+    const answer = `Réponse IA (demo) : ${message}`;
+
+    /* ---- 4. Réponse ---- */
+    return res.json({
       ok: true,
       answer,
-      conversationId: req.body?.conversationId || null,
+      conversationId: conversationId || Date.now().toString()
     });
-  } catch (e) {
-    return res.status(500).json({ ok: false, error: String(e?.message || e) });
+
+  } catch (err) {
+    console.error("🔥 Erreur serveur :", err);
+    return res.status(500).json({
+      ok: false,
+      error: "server_error"
+    });
   }
 });
 
-// Exemple route admin (optionnel)
-app.get("/admin/ping", requireBearerToken(ADMIN_TOKEN), (req, res) => {
-  res.status(200).json({ ok: true, admin: true });
-});
+/* =========================
+   START SERVER
+========================= */
 
-// --- Start
 app.listen(PORT, () => {
-  console.log(`Server running on port ${PORT}`);
+  console.log(`🚀 Olympeus AI server running on port ${PORT}`);
 });
