@@ -1,82 +1,44 @@
-import express from "express";
-import cors from "cors";
-import bodyParser from "body-parser";
-import Stripe from "stripe";
-import pg from "pg";
-import OpenAI from "openai";
+const FREE_DAILY_LIMIT = parseInt(process.env.FREE_DAILY_LIMIT || "5", 10);
 
-const app = express();
-app.use(cors());
-app.use(bodyParser.json());
-
-const PORT = process.env.PORT || 10000;
-
-const OLYMPEUS_SHARED_TOKEN = process.env.OLYMPEUS_SHARED_TOKEN || "";
-const OPENAI_API_KEY = process.env.OPENAI_API_KEY || "";
-const OPENAI_MODEL = process.env.OPENAI_MODEL || "gpt-4o-mini";
-const OPENAI_MAX_TOKENS = parseInt(process.env.OPENAI_MAX_TOKENS || "500", 10);
-
-const { Pool } = pg;
-const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
-  ssl: { rejectUnauthorized: false },
-});
-
-const openai = new OpenAI({ apiKey: OPENAI_API_KEY });
-
-// --- petit helper sécurité token (WP -> Render) ---
-function requireSharedToken(req, res) {
-  if (!OLYMPEUS_SHARED_TOKEN) return true; // si tu veux forcer, enlève cette ligne
-  const token = req.header("x-olympeus-token");
-  if (!token || token !== OLYMPEUS_SHARED_TOKEN) {
-    res.status(401).json({ ok: false, error: "unauthorized_token" });
-    return false;
-  }
-  return true;
+// on identifie l'utilisateur WP (sinon, on refuse)
+if (!wpUserId) {
+  return res.status(401).json({ ok: false, error: "wp_user_required" });
 }
 
-app.get("/ping", (req, res) => res.status(200).send("Olympeus API OK"));
+// 1) vérifier premium
+const userRow = await pool.query(
+  "select is_premium from oly_users where wp_user_id=$1",
+  [String(wpUserId)]
+);
 
-app.post("/post-assist", async (req, res) => {
-  try {
-    if (!requireSharedToken(req, res)) return;
+const isPremium = userRow.rowCount ? !!userRow.rows[0].is_premium : false;
 
-    const { message, web, expert, conversationId, wpUserId, wpUserEmail } = req.body || {};
-    if (!message || typeof message !== "string") {
-      return res.status(400).json({ ok: false, error: "missing_message" });
-    }
+// 2) si pas premium -> limiter
+if (!isPremium) {
+  const day = new Date().toISOString().slice(0, 10); // YYYY-MM-DD
 
-    if (!OPENAI_API_KEY) {
-      return res.status(500).json({ ok: false, error: "missing_openai_api_key" });
-    }
+  await pool.query(
+    "insert into oly_usage_daily(day, wp_user_id, count) values($1,$2,0) on conflict (day, wp_user_id) do nothing",
+    [day, String(wpUserId)]
+  );
 
-    // prompt simple (tu pourras enrichir après)
-    const system = `Tu es Olympeus AI. Réponds en français de façon claire et utile.`;
-    const user = message.trim();
+  const usage = await pool.query(
+    "select count from oly_usage_daily where day=$1 and wp_user_id=$2",
+    [day, String(wpUserId)]
+  );
 
-    const r = await openai.chat.completions.create({
-      model: OPENAI_MODEL,
-      messages: [
-        { role: "system", content: system },
-        { role: "user", content: user },
-      ],
-      max_tokens: OPENAI_MAX_TOKENS,
-      temperature: 0.7,
+  const count = usage.rows[0]?.count ?? 0;
+
+  if (count >= FREE_DAILY_LIMIT) {
+    return res.status(402).json({
+      ok: false,
+      error: "free_limit_reached",
+      limit: FREE_DAILY_LIMIT
     });
-
-    const answer = r.choices?.[0]?.message?.content?.trim() || "Réponse vide.";
-
-    return res.json({
-      ok: true,
-      conversationId: conversationId || null,
-      answer,
-    });
-  } catch (err) {
-    console.error("post-assist error:", err);
-    return res.status(500).json({ ok: false, error: "server_error" });
   }
-});
 
-app.listen(PORT, () => {
-  console.log(`Server running on port ${PORT}`);
-});
+  await pool.query(
+    "update oly_usage_daily set count = count + 1 where day=$1 and wp_user_id=$2",
+    [day, String(wpUserId)]
+  );
+}
