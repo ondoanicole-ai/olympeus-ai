@@ -1,202 +1,171 @@
-<?php
-/**
- * Olympeus AI - Public chat (visiteurs) + Token + Rate limit
- * Shortcode: [olympeus_ai]
- */
+import express from "express";
+import cors from "cors";
 
-/** ========= A) CONFIG ========= */
-define('OLYMPEUS_RENDER_URL', 'https://olympeus-ai.onrender.com/post-assist'); // ton endpoint Render
-define('OLYMPEUS_SHARED_TOKEN', 'REPLACE_ME_WITH_YOUR_SHARED_TOKEN'); // EXACTEMENT le même que sur Render
+const app = express();
 
-// Limite FREE (visiteurs / non-connectés) : X requêtes / jour / IP
-define('OLYMPEUS_FREE_DAILY_LIMIT', 5);
+/* =========================
+   CONFIG
+========================= */
 
-/** ========= B) SHORTCODE UI ========= */
-add_shortcode('olympeus_ai', function () {
-  // imprime le JS une seule fois si le shortcode existe sur la page
-  add_action('wp_footer', 'olympeus_ai_print_inline_script', 99);
+const PORT = process.env.PORT || 10000;
+const SHARED_TOKEN = process.env.OLYMPEUS_SHARED_TOKEN || "";
 
-  ob_start(); ?>
-  <div id="olympeus-ai" style="max-width:900px;margin:40px auto;padding:24px;background:#fff;border-radius:14px;box-shadow:0 10px 30px rgba(0,0,0,.08);">
-    <h2 style="margin:0 0 6px 0;">Olympeus AI</h2>
-    <div style="opacity:.7;margin-bottom:16px;">Assistant intelligent</div>
+/* =========================
+   MIDDLEWARES
+========================= */
 
-    <div id="olympeus-messages" style="min-height:120px;padding:12px;border:1px solid #eee;border-radius:10px;margin-bottom:12px;overflow:auto;"></div>
+app.use(cors());
+app.use(express.json({ limit: "1mb" }));
 
-    <div style="display:flex;gap:12px;align-items:center;margin-bottom:12px;">
-      <label style="display:flex;gap:6px;align-items:center;font-size:14px;">
-        <input type="checkbox" id="olympeus-web" />
-        Recherche web
-      </label>
-      <label style="display:flex;gap:6px;align-items:center;font-size:14px;">
-        <input type="checkbox" id="olympeus-expert" />
-        Mode expert
-      </label>
-    </div>
+/* =========================
+   HEALTH CHECK
+========================= */
 
-    <form id="olympeus-form" style="display:flex;gap:10px;">
-      <input id="olympeus-input" type="text" placeholder="Écris ton message..." style="flex:1;padding:10px 12px;border:1px solid #ddd;border-radius:10px;" />
-      <button type="submit" style="padding:10px 16px;border:0;border-radius:10px;background:#1e73be;color:#fff;cursor:pointer;">Envoyer</button>
-    </form>
-  </div>
-  <?php
-  return ob_get_clean();
+app.get("/", (req, res) => {
+  res.json({
+    ok: true,
+    service: "olympeus-ai",
+    status: "running"
+  });
 });
 
-/** ========= C) REST ROUTE (PUBLIC) ========= */
-add_action('rest_api_init', function () {
-  register_rest_route('olympeus/v1', '/chat', [
-    'methods'  => 'POST',
-    'callback' => 'olympeus_ai_rest_chat',
-    // PUBLIC : on gère la sécurité nous-mêmes via token
-    'permission_callback' => '__return_true',
-  ]);
-});
+/* =========================
+   POST /post-assist
+========================= */
 
-function olympeus_ai_rest_chat(WP_REST_Request $request) {
+app.post("/post-assist", async (req, res) => {
+  try {
+    /* ---- 1. Vérif TOKEN ---- */
+    const token =
+      req.headers["x-olympeus-token"] ||
+      req.headers["authorization"] ||
+      "";
 
-  /** 1) Sécurité: token obligatoire (pour éviter qu'on appelle ton WP endpoint depuis n'importe où) */
-  $client_token = $request->get_header('x-olympeus-token');
-  if (!$client_token) $client_token = $request->get_header('X-Olympeus-Token');
-
-  if (!$client_token || $client_token !== OLYMPEUS_SHARED_TOKEN) {
-    return new WP_REST_Response(['ok' => false, 'error' => 'unauthorized'], 401);
-  }
-
-  /** 2) Limite FREE : si visiteur (non connecté), on limite par IP */
-  if (!is_user_logged_in()) {
-    $ip = isset($_SERVER['REMOTE_ADDR']) ? $_SERVER['REMOTE_ADDR'] : '0.0.0.0';
-    $day = gmdate('Ymd');
-    $key = 'olympeus_rl_' . md5($ip . '_' . $day);
-
-    $count = (int) get_transient($key);
-
-    if ($count >= OLYMPEUS_FREE_DAILY_LIMIT) {
-      return new WP_REST_Response([
-        'ok' => false,
-        'error' => 'free_limit_reached',
-        'limit' => OLYMPEUS_FREE_DAILY_LIMIT
-      ], 402);
+    if (!SHARED_TOKEN) {
+      console.warn("⚠️ Aucun token configuré côté serveur");
     }
 
-    // on incrémente
-    set_transient($key, $count + 1, DAY_IN_SECONDS);
-  }
-
-  /** 3) Payload JSON */
-  $body = $request->get_json_params();
-  if (!is_array($body) || empty($body['message'])) {
-    return new WP_REST_Response(['ok' => false, 'error' => 'missing_message'], 400);
-  }
-
-  /** 4) Proxy vers Render */
-  $headers = [
-    'Content-Type' => 'application/json',
-    // on transmet le token au backend Render (il doit le vérifier aussi)
-    'x-olympeus-token' => OLYMPEUS_SHARED_TOKEN,
-  ];
-
-  $resp = wp_remote_post(OLYMPEUS_RENDER_URL, [
-    'headers' => $headers,
-    'body'    => wp_json_encode($body),
-    'timeout' => 60,
-  ]);
-
-  if (is_wp_error($resp)) {
-    return new WP_REST_Response(['ok' => false, 'error' => $resp->get_error_message()], 502);
-  }
-
-  $status = wp_remote_retrieve_response_code($resp);
-  $text   = wp_remote_retrieve_body($resp);
-
-  // si c'est du JSON, on renvoie du JSON, sinon texte brut
-  $json = json_decode($text, true);
-  if (json_last_error() === JSON_ERROR_NONE) {
-    return new WP_REST_Response($json, $status ?: 200);
-  }
-
-  return new WP_REST_Response([
-    'ok' => ($status >= 200 && $status < 300),
-    'raw' => $text
-  ], $status ?: 200);
-}
-
-/** ========= D) JS INLINE (FRONT) ========= */
-function olympeus_ai_print_inline_script() {
-  static $printed = false;
-  if ($printed) return;
-  $printed = true;
-
-  $rest_url = esc_url_raw( rest_url('olympeus/v1/chat') );
-  $token    = OLYMPEUS_SHARED_TOKEN;
-  ?>
-  <script>
-  (function(){
-    const REST_URL = <?php echo json_encode($rest_url); ?>;
-    const TOKEN    = <?php echo json_encode($token); ?>;
-
-    const root = document.getElementById('olympeus-ai');
-    if(!root) return;
-
-    const messagesEl = document.getElementById('olympeus-messages');
-    const form = document.getElementById('olympeus-form');
-    const input = document.getElementById('olympeus-input');
-    const webCb = document.getElementById('olympeus-web');
-    const expertCb = document.getElementById('olympeus-expert');
-
-    function addMsg(text, who){
-      const div = document.createElement('div');
-      div.style.margin = '8px 0';
-      div.innerHTML = `<b>${who === 'user' ? 'Vous' : 'Olympeus'} :</b> ${String(text)}`;
-      messagesEl.appendChild(div);
-      messagesEl.scrollTop = messagesEl.scrollHeight;
-    }
-
-    async function sendMessage(message){
-      const payload = {
-        message,
-        expert: !!(expertCb && expertCb.checked),
-        web: { enabled: !!(webCb && webCb.checked), query: "" }
-      };
-
-      const res = await fetch(REST_URL, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "X-Olympeus-Token": TOKEN
-        },
-        body: JSON.stringify(payload)
+    if (SHARED_TOKEN && token !== SHARED_TOKEN) {
+      console.warn("❌ Token invalide", { token });
+      return res.status(401).json({
+        ok: false,
+        error: "unauthorized"
       });
-
-      const data = await res.json().catch(() => null);
-      if(!res.ok){
-        const err = (data && (data.error || data.message)) ? (data.error || data.message) : ("HTTP " + res.status);
-        throw new Error(err);
-      }
-
-      // compat: selon ton backend
-      if (data && data.answer) return data.answer;
-      if (data && data.response) return data.response;
-      if (data && data.message) return data.message;
-      return "Réponse vide";
     }
 
-    form.addEventListener('submit', async (e) => {
-      e.preventDefault();
-      const msg = (input.value || "").trim();
-      if(!msg) return;
+    /* ---- 2. Vérif payload ---- */
+    const { message, conversationId, expert, web } = req.body || {};
 
-      input.value = "";
-      addMsg(msg, "user");
+    if (!message || typeof message !== "string") {
+      return res.status(400).json({
+        ok: false,
+        error: "missing_message"
+      });
+    }
 
-      try{
-        const answer = await sendMessage(msg);
-        addMsg(answer, "assistant");
-      }catch(err){
-        addMsg("✗ " + err.message, "assistant");
-      }
-    });
-  })();
-  </script>
-  <?php
+  import express from "express";
+import cors from "cors";
+import bodyParser from "body-parser";
+import Stripe from "stripe";
+import pg from "pg";
+import OpenAI from "openai";
+
+const app = express();
+app.use(cors());
+app.use(bodyParser.json());
+
+const PORT = process.env.PORT || 10000;
+
+const OLYMPEUS_SHARED_TOKEN = process.env.OLYMPEUS_SHARED_TOKEN || "";
+const OPENAI_API_KEY = process.env.OPENAI_API_KEY || "";
+const OPENAI_MODEL = process.env.OPENAI_MODEL || "gpt-4o-mini";
+const OPENAI_MAX_TOKENS = parseInt(process.env.OPENAI_MAX_TOKENS || "500", 10);
+
+const { Pool } = pg;
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: { rejectUnauthorized: false },
+});
+
+const openai = new OpenAI({ apiKey: OPENAI_API_KEY });
+
+// --- petit helper sécurité token (WP -> Render) ---
+function requireSharedToken(req, res) {
+  if (!OLYMPEUS_SHARED_TOKEN) return true; // si tu veux forcer, enlève cette ligne
+  const token = req.header("x-olympeus-token");
+  if (!token || token !== OLYMPEUS_SHARED_TOKEN) {
+    res.status(401).json({ ok: false, error: "unauthorized_token" });
+    return false;
+  }
+  return true;
 }
+
+app.get("/ping", (req, res) => res.status(200).send("Olympeus API OK"));
+
+app.post("/post-assist", async (req, res) => {
+  try {
+    if (!requireSharedToken(req, res)) return;
+
+    const { message, web, expert, conversationId, wpUserId, wpUserEmail } = req.body || {};
+    if (!message || typeof message !== "string") {
+      return res.status(400).json({ ok: false, error: "missing_message" });
+    }
+
+    if (!OPENAI_API_KEY) {
+      return res.status(500).json({ ok: false, error: "missing_openai_api_key" });
+    }
+
+    // prompt simple (tu pourras enrichir après)
+    const system = `Tu es Olympeus AI. Réponds en français de façon claire et utile.`;
+    const user = message.trim();
+
+    const r = await openai.chat.completions.create({
+      model: OPENAI_MODEL,
+      messages: [
+        { role: "system", content: system },
+        { role: "user", content: user },
+      ],
+      max_tokens: OPENAI_MAX_TOKENS,
+      temperature: 0.7,
+    });
+
+    const answer = r.choices?.[0]?.message?.content?.trim() || "Réponse vide.";
+
+    return res.json({
+      ok: true,
+      conversationId: conversationId || null,
+      answer,
+    });
+  } catch (err) {
+    console.error("post-assist error:", err);
+    return res.status(500).json({ ok: false, error: "server_error" });
+  }
+});
+
+app.listen(PORT, () => {
+  console.log(`Server running on port ${PORT}`);
+});
+
+    /* ---- 4. Réponse ---- */
+    return res.json({
+      ok: true,
+      answer,
+      conversationId: conversationId || Date.now().toString()
+    });
+
+  } catch (err) {
+    console.error("🔥 Erreur serveur :", err);
+    return res.status(500).json({
+      ok: false,
+      error: "server_error"
+    });
+  }
+});
+
+/* =========================
+   START SERVER
+========================= */
+
+app.listen(PORT, () => {
+  console.log(`🚀 Olympeus AI server running on port ${PORT}`);
+});
