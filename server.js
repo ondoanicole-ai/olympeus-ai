@@ -1,200 +1,178 @@
 import express from "express";
+import cors from "cors";
 
 const app = express();
 app.use(express.json({ limit: "1mb" }));
 
-/** ======================
- *  CONFIG
- *  ====================== */
-const PORT = process.env.PORT || 10000;
+/** =========================
+ * CONFIG
+ * ========================= */
+const PORT = Number(process.env.PORT || 10000);
 
-// OpenAI
-const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
-const OPENAI_MODEL = process.env.OPENAI_MODEL || "gpt-4.1-mini"; // ou "gpt-4.1"
+const OPENAI_API_KEY = process.env.OPENAI_API_KEY || "";
+const OPENAI_MODEL = process.env.OPENAI_MODEL || "gpt-4.1";
 const OPENAI_BASE_URL = process.env.OPENAI_BASE_URL || "https://api.openai.com/v1";
 
-// Security: token partagé WP -> Render
-const OLYMPEUS_SHARED_TOKEN = process.env.OLYMPEUS_SHARED_TOKEN;
-
-// CORS (si tu veux le limiter)
+const OLYMPEUS_SHARED_TOKEN = process.env.OLYMPEUS_SHARED_TOKEN || "";
 const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || "https://olympe-us.com";
 
-/** ======================
- *  UTILS
- *  ====================== */
-function jsonError(res, status, code, extra = {}) {
-  return res.status(status).json({ ok: false, error: code, ...extra });
-}
+// Rate limit (mémoire simple)
+const FREE_DAILY_LIMIT = Number(process.env.FREE_DAILY_LIMIT || 20);
+const memoryDaily = new Map(); // key -> { count, dayKey }
 
-function requireSharedToken(req, res) {
-  if (!OLYMPEUS_SHARED_TOKEN) {
-    return jsonError(res, 500, "missing_shared_token_env");
-  }
-  const token = req.headers["x-olympeus-token"];
-  if (!token || token !== OLYMPEUS_SHARED_TOKEN) {
-    return jsonError(res, 401, "unauthorized");
-  }
-  return null;
-}
-
-function buildSystemPrompt({ expert }) {
-  const base =
-    "Tu es Olympeus AI, assistant utile, clair, et fiable. Réponds en français.";
-  if (expert) {
-    return (
-      base +
-      " Mode EXPERT: réponse structurée (titres, étapes), précise, avec nuances. " +
-      "Si la question touche au droit: cite les notions générales, et propose des vérifications, sans inventer."
-    );
-  }
-  return base + " Mode STANDARD: réponse courte, simple et actionnable.";
-}
-
-function buildUserPrompt({ message, web }) {
-  const webHint = web ? " (Tu peux proposer des pistes de recherche web, sans inventer de sources.)" : "";
-  return `${message}${webHint}`;
-}
-
-async function callOpenAIResponse({ message, expert, web, userLabel }) {
-  if (!OPENAI_API_KEY) {
-    return { ok: false, status: 500, error: "missing_openai_api_key" };
-  }
-
-  const payload = {
-    model: OPENAI_MODEL,
-    input: [
-      {
-        role: "system",
-        content: [{ type: "text", text: buildSystemPrompt({ expert }) }],
-      },
-      {
-        role: "user",
-        content: [
-          {
-            type: "text",
-            text: buildUserPrompt({ message, web }),
-          },
-        ],
-      },
-    ],
-    // Petit plus: on “tag” l’utilisateur côté backend (utile logs)
-    metadata: { user: userLabel || "unknown" },
-  };
-
-  const resp = await fetch(`${OPENAI_BASE_URL}/responses`, {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${OPENAI_API_KEY}`,
-      "Content-Type": "application/json",
+/** =========================
+ * CORS (utile si tu testes en direct)
+ * ========================= */
+app.use(
+  cors({
+    origin: (origin, cb) => {
+      // autorise appels serveur->serveur (pas d'origin) + ton domaine
+      if (!origin || origin === ALLOWED_ORIGIN) return cb(null, true);
+      return cb(new Error("CORS blocked"), false);
     },
-    body: JSON.stringify(payload),
-  });
+    methods: ["GET", "POST", "OPTIONS"],
+    allowedHeaders: ["Content-Type", "X-Olympeus-Token"],
+  })
+);
 
-  const text = await resp.text();
-  let json = null;
-  try {
-    json = JSON.parse(text);
-  } catch {
-    // parfois OpenAI renvoie un message non JSON si proxy/WAF
-  }
+app.options("*", (req, res) => res.sendStatus(204));
 
-  if (!resp.ok) {
-    return {
-      ok: false,
-      status: resp.status,
-      error: "upstream_openai_error",
-      detail: json || { raw: text },
-    };
-  }
-
-  // Récupération du texte final (Responses API)
-  const answer =
-    (json.output_text && String(json.output_text)) ||
-    // fallback si output_text absent
-    "";
-
-  return { ok: true, answer, raw: json };
+/** =========================
+ * UTILS
+ * ========================= */
+function todayKeyUTC() {
+  const d = new Date();
+  const y = d.getUTCFullYear();
+  const m = String(d.getUTCMonth() + 1).padStart(2, "0");
+  const day = String(d.getUTCDate()).padStart(2, "0");
+  return `${y}${m}${day}`;
 }
 
-/** ======================
- *  ROUTES
- *  ====================== */
+function getClientIp(req) {
+  const xf = req.headers["x-forwarded-for"];
+  if (typeof xf === "string" && xf.length > 0) return xf.split(",")[0].trim();
+  return req.socket?.remoteAddress || "unknown";
+}
 
-app.get("/", (req, res) => res.status(200).send("OK"));
+function checkSharedToken(req) {
+  if (!OLYMPEUS_SHARED_TOKEN) return true; // si pas défini, on n'active pas la protection
+  const token = req.headers["x-olympeus-token"];
+  return token && token === OLYMPEUS_SHARED_TOKEN;
+}
 
-// Non-streaming
-app.post("/post-assist", async (req, res) => {
-  const err = requireSharedToken(req, res);
-  if (err) return;
+function rateLimitKey(req, body) {
+  // Priorité : wpUserId si fourni, sinon IP
+  if (body?.wpUserId) return `user:${String(body.wpUserId)}`;
+  return `ip:${getClientIp(req)}`;
+}
 
-  const { message, expert = false, web = false, wpUser = "guest" } = req.body || {};
-  if (!message || typeof message !== "string") {
-    return jsonError(res, 400, "missing_message");
+function bumpDailyLimit(key) {
+  const dayKey = todayKeyUTC();
+  const cur = memoryDaily.get(key);
+  if (!cur || cur.dayKey !== dayKey) {
+    memoryDaily.set(key, { count: 1, dayKey });
+    return { ok: true, count: 1, limit: FREE_DAILY_LIMIT };
   }
+  if (cur.count >= FREE_DAILY_LIMIT) {
+    return { ok: false, count: cur.count, limit: FREE_DAILY_LIMIT };
+  }
+  cur.count += 1;
+  memoryDaily.set(key, cur);
+  return { ok: true, count: cur.count, limit: FREE_DAILY_LIMIT };
+}
 
-  try {
-    const out = await callOpenAIResponse({
-      message,
-      expert: !!expert,
-      web: !!web,
-      userLabel: wpUser,
-    });
+function buildPrompt({ message, expert, web }) {
+  const mode = expert ? "MODE EXPERT" : "MODE SIMPLE";
+  const webHint = web ? "Tu peux proposer des requêtes de recherche web, mais ne mens pas." : "Pas de web.";
+  return [
+    `Tu es Olympeus AI.`,
+    `Réponds en français.`,
+    `Mode: ${mode}.`,
+    webHint,
+    ``,
+    `Question utilisateur:`,
+    message,
+  ].join("\n");
+}
 
-    if (!out.ok) {
-      return res.status(502).json(out);
+function extractOutputText(openaiJson) {
+  // Réponses API: souvent output_text est présent
+  if (typeof openaiJson?.output_text === "string") return openaiJson.output_text;
+
+  // Sinon, essayer output[] -> content[]
+  const out = openaiJson?.output;
+  if (Array.isArray(out)) {
+    let text = "";
+    for (const item of out) {
+      const content = item?.content;
+      if (Array.isArray(content)) {
+        for (const c of content) {
+          if (typeof c?.text === "string") text += c.text;
+          if (typeof c?.content === "string") text += c.content;
+        }
+      }
     }
-
-    return res.json({
-      ok: true,
-      answer: out.answer,
-      conversationId: Date.now().toString(),
-      model: OPENAI_MODEL,
-    });
-  } catch (e) {
-    return jsonError(res, 500, "server_error", { detail: String(e?.message || e) });
+    if (text.trim()) return text.trim();
   }
+  return "";
+}
+
+/** =========================
+ * HEALTH
+ * ========================= */
+app.get("/", (req, res) => {
+  res.json({ ok: true, name: "olympeus-ai", status: "alive" });
 });
 
-// Streaming SSE (simple)
-app.post("/post-assist/stream", async (req, res) => {
-  const err = requireSharedToken(req, res);
-  if (err) return;
-
-  const { message, expert = false, web = false, wpUser = "guest" } = req.body || {};
-  if (!message || typeof message !== "string") {
-    return jsonError(res, 400, "missing_message");
-  }
-  if (!OPENAI_API_KEY) return jsonError(res, 500, "missing_openai_api_key");
-
-  // SSE headers
-  res.setHeader("Content-Type", "text/event-stream; charset=utf-8");
-  res.setHeader("Cache-Control", "no-cache, no-transform");
-  res.setHeader("Connection", "keep-alive");
-
-  // Helper SSE
-  const send = (event, data) => {
-    res.write(`event: ${event}\n`);
-    res.write(`data: ${JSON.stringify(data)}\n\n`);
-  };
-
+/** =========================
+ * MAIN ENDPOINT (WordPress proxy -> Render)
+ * ========================= */
+app.post("/post-assist", async (req, res) => {
   try {
+    // 1) Token
+    if (!checkSharedToken(req)) {
+      return res.status(401).json({ ok: false, error: "unauthorized" });
+    }
+
+    // 2) Body
+    const { message, expert = false, web = false, wpUserId = null } = req.body || {};
+    if (!message || typeof message !== "string" || !message.trim()) {
+      return res.status(400).json({ ok: false, error: "missing_message" });
+    }
+
+    // 3) Rate limit
+    const key = rateLimitKey(req, { wpUserId });
+    const rl = bumpDailyLimit(key);
+    if (!rl.ok) {
+      return res.status(429).json({
+        ok: false,
+        error: "rate_limited",
+        detail: { limit: rl.limit, count: rl.count },
+      });
+    }
+
+    // 4) OpenAI config check
+    if (!OPENAI_API_KEY) {
+      return res.status(500).json({ ok: false, error: "missing_openai_key" });
+    }
+
+    // 5) Prompt
+    const prompt = buildPrompt({ message: message.trim(), expert: !!expert, web: !!web });
+
+    // 6) Call OpenAI Responses API (FORMAT CORRECT)
     const payload = {
       model: OPENAI_MODEL,
-      stream: true,
       input: [
         {
-          role: "system",
-          content: [{ type: "text", text: buildSystemPrompt({ expert: !!expert }) }],
-        },
-        {
           role: "user",
-          content: [{ type: "text", text: buildUserPrompt({ message, web: !!web }) }],
+          content: [{ type: "input_text", text: prompt }],
         },
       ],
-      metadata: { user: wpUser || "unknown" },
+      temperature: expert ? 0.2 : 0.5,
+      max_output_tokens: expert ? 800 : 500,
     };
 
-    const upstream = await fetch(`${OPENAI_BASE_URL}/responses`, {
+    const resp = await fetch(`${OPENAI_BASE_URL}/responses`, {
       method: "POST",
       headers: {
         Authorization: `Bearer ${OPENAI_API_KEY}`,
@@ -203,56 +181,45 @@ app.post("/post-assist/stream", async (req, res) => {
       body: JSON.stringify(payload),
     });
 
-    if (!upstream.ok || !upstream.body) {
-      const t = await upstream.text();
-      send("error", {
+    const text = await resp.text();
+    let json;
+    try {
+      json = JSON.parse(text);
+    } catch {
+      return res.status(502).json({ ok: false, error: "openai_non_json", raw: text.slice(0, 500) });
+    }
+
+    if (!resp.ok) {
+      // renvoyer l'erreur OpenAI telle quelle pour debug côté WP (mais sans exposer la clé)
+      return res.status(502).json({
         ok: false,
         error: "upstream_openai_error",
-        status: upstream.status,
-        detail: t,
+        detail: json,
       });
-      return res.end();
     }
 
-    send("meta", { ok: true, model: OPENAI_MODEL });
-
-    // On relaie le flux tel quel (SSE OpenAI -> SSE client)
-    const reader = upstream.body.getReader();
-    const decoder = new TextDecoder("utf-8");
-    let buffer = "";
-
-    while (true) {
-      const { value, done } = await reader.read();
-      if (done) break;
-
-      buffer += decoder.decode(value, { stream: true });
-
-      // OpenAI renvoie des lignes SSE "data: ..."
-      const lines = buffer.split("\n");
-      buffer = lines.pop() || "";
-
-      for (const line of lines) {
-        const trimmed = line.trim();
-        if (!trimmed.startsWith("data:")) continue;
-        const data = trimmed.slice(5).trim();
-        if (data === "[DONE]") {
-          send("done", { ok: true });
-          res.end();
-          return;
-        }
-        // On renvoie la ligne brute au client
-        send("chunk", { raw: data });
-      }
+    const answer = extractOutputText(json);
+    if (!answer) {
+      return res.status(502).json({
+        ok: false,
+        error: "empty_openai_answer",
+        detail: json,
+      });
     }
 
-    send("done", { ok: true });
-    res.end();
-  } catch (e) {
-    send("error", { ok: false, error: "server_error", detail: String(e?.message || e) });
-    res.end();
+    return res.json({
+      ok: true,
+      answer,
+      model: OPENAI_MODEL,
+      usage: json?.usage || null,
+      rate: { count: rl.count, limit: rl.limit },
+    });
+  } catch (err) {
+    console.error("Server error:", err);
+    return res.status(500).json({ ok: false, error: "server_error" });
   }
 });
 
 app.listen(PORT, () => {
-  console.log(`✅ Olympeus AI server running on port ${PORT}`);
+  console.log(`Olympeus AI server running on port ${PORT}`);
 });
