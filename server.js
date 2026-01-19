@@ -1,198 +1,172 @@
 import express from "express";
-import helmet from "helmet";
 import cors from "cors";
 
-// Node 22 => fetch est natif (pas besoin de node-fetch)
-
-// ===============================
-// CONFIG ENV (Render)
-// ===============================
-const PORT = process.env.PORT || 10000;
-
-// Sécurité : token partagé WP -> Render (header x-olympeus-token)
-const SHARED_TOKEN = process.env.OLYMPEUS_SHARED_TOKEN || "";
-
-// OpenAI
-const OPENAI_API_KEY = process.env.OPENAI_API_KEY || "";
-const OPENAI_MODEL = process.env.OPENAI_MODEL || "gpt-4o-mini";
-
-// Rate limit simple (mémoire) — suffisant pour commencer
-const RATE_LIMIT_PER_IP_PER_DAY = Number(process.env.RATE_LIMIT_PER_IP_PER_DAY || 20);
-
-// ===============================
-// APP
-// ===============================
 const app = express();
 
-app.use(helmet());
+/**
+ * ENV attendues sur Render :
+ * - OPENAI_API_KEY
+ * - OLYMPEUS_SHARED_TOKEN
+ * - ALLOWED_ORIGIN   (ex: https://olympe-us.com)  (optionnel mais recommandé)
+ * - MODEL            (ex: gpt-4o)
+ */
+const OPENAI_API_KEY = process.env.OPENAI_API_KEY || "";
+const SHARED_TOKEN = process.env.OLYMPEUS_SHARED_TOKEN || "";
+const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || "";
+const MODEL = process.env.MODEL || "gpt-4o";
 
-// Comme WP appelle Render côté serveur (wp_remote_post), CORS n'est pas indispensable.
-// Mais on laisse en "safe" (au cas où tu testes direct depuis navigateur).
-app.use(
-  cors({
-    origin: true,
-    credentials: false,
-  })
-);
+const PORT = process.env.PORT ? Number(process.env.PORT) : 10000;
+
+if (!OPENAI_API_KEY) {
+  console.error("❌ OPENAI_API_KEY manquante (Render env).");
+}
+if (!SHARED_TOKEN) {
+  console.error("❌ OLYMPEUS_SHARED_TOKEN manquant (Render env).");
+}
 
 app.use(express.json({ limit: "1mb" }));
 
-// ===============================
-// RATE LIMIT (simple mémoire)
-// ===============================
-const ipCounters = new Map(); // key = `${yyyy-mm-dd}:${ip}` => count
+// CORS (si ALLOWED_ORIGIN vide, on autorise tout - pas recommandé en prod)
+app.use(
+  cors({
+    origin: ALLOWED_ORIGIN ? ALLOWED_ORIGIN : true,
+    methods: ["POST", "GET", "OPTIONS"],
+    allowedHeaders: ["Content-Type", "x-olympeus-token"],
+  })
+);
 
-function getDayKey() {
-  const d = new Date();
-  const yyyy = d.getUTCFullYear();
-  const mm = String(d.getUTCMonth() + 1).padStart(2, "0");
-  const dd = String(d.getUTCDate()).padStart(2, "0");
-  return `${yyyy}-${mm}-${dd}`;
-}
+// --- A2 : mini mémoire en RAM par conversationId ---
+const memory = new Map(); // conversationId => [{role, content}, ...]
+const MAX_TURNS = 12;
 
-function rateLimitMiddleware(req, res, next) {
-  const day = getDayKey();
+// --- B2 : rate-limit simple (RAM) ---
+const hits = new Map(); // ip => {count, resetAt}
+const WINDOW_MS = 60_000; // 1 min
+const MAX_REQ_PER_WINDOW = 30;
+
+function rateLimit(req, res, next) {
   const ip =
-    (req.headers["x-forwarded-for"] || "")
-      .toString()
-      .split(",")[0]
-      .trim() ||
+    (req.headers["x-forwarded-for"]?.toString().split(",")[0] || "").trim() ||
     req.socket.remoteAddress ||
     "unknown";
 
-  const key = `${day}:${ip}`;
-  const count = ipCounters.get(key) || 0;
+  const now = Date.now();
+  const rec = hits.get(ip);
 
-  if (count >= RATE_LIMIT_PER_IP_PER_DAY) {
-    return res.status(429).json({
-      ok: false,
-      error: "free_limit_reached",
-      limit: RATE_LIMIT_PER_IP_PER_DAY,
-    });
+  if (!rec || now > rec.resetAt) {
+    hits.set(ip, { count: 1, resetAt: now + WINDOW_MS });
+    return next();
   }
 
-  ipCounters.set(key, count + 1);
-  next();
+  rec.count += 1;
+  if (rec.count > MAX_REQ_PER_WINDOW) {
+    return res.status(429).json({ ok: false, error: "rate_limited" });
+  }
+  return next();
 }
 
-// ===============================
-// AUTH (token partagé)
-// ===============================
+// --- B1 : middleware sécurité token ---
 function requireSharedToken(req, res, next) {
-  // Header envoyé par WP : x-olympeus-token
-  const token =
-    (req.headers["x-olympeus-token"] || req.headers["X-Olymp eus-Token"] || "")
-      .toString()
-      .trim();
-
-  // Si tu n’as pas encore mis de token côté Render, on refuse (sinon n’importe qui peut appeler)
-  if (!SHARED_TOKEN) {
-    return res.status(500).json({
-      ok: false,
-      error: "server_misconfigured_missing_shared_token",
-    });
-  }
-
-  if (!token || token !== SHARED_TOKEN) {
+  const token = req.header("x-olympeus-token") || "";
+  if (!SHARED_TOKEN || token !== SHARED_TOKEN) {
     return res.status(401).json({ ok: false, error: "unauthorized" });
   }
-
-  next();
+  return next();
 }
 
-// ===============================
-// HEALTHCHECK
-// ===============================
+// Ping
 app.get("/", (req, res) => {
-  res.status(200).send("Olympeus API OK ✅");
+  res.status(200).send("Olympeus API OK");
 });
 
-// ===============================
-// MAIN ENDPOINT
-// ===============================
-app.post("/post-assist", requireSharedToken, rateLimitMiddleware, async (req, res) => {
+/**
+ * Endpoint appelé par WordPress (proxy)
+ */
+app.post("/post-assist", rateLimit, requireSharedToken, async (req, res) => {
   try {
-    // 1) Validation input
-    const body = req.body || {};
-    const message = typeof body.message === "string" ? body.message.trim() : "";
+    const { message, conversationId } = req.body || {};
 
-    // options envoyées depuis WP (facultatif)
-    const conversationId =
-      typeof body.conversationId === "string" ? body.conversationId : null;
-
-    const expert = !!body.expert;
-    const webEnabled = !!(body.web && body.web.enabled);
-
-    if (!message) {
+    // --- B2 validation ---
+    const msg = (message ?? "").toString().trim();
+    if (!msg) {
       return res.status(400).json({ ok: false, error: "missing_message" });
     }
-
-    // 2) Vérif OpenAI key
-    if (!OPENAI_API_KEY) {
-      return res.status(500).json({
-        ok: false,
-        error: "server_misconfigured_missing_openai_key",
-      });
+    if (msg.length > 2000) {
+      return res.status(400).json({ ok: false, error: "message_too_long" });
     }
 
-    // 3) Construire le prompt (simple + propre)
-    const systemParts = [
-      "Tu es Olympeus AI, un assistant utile et fiable.",
-      "Réponds en français sauf si l'utilisateur demande une autre langue.",
-      expert ? "Mode expert: réponse plus structurée, plus détaillée, avec définitions si utile." : "Mode standard: réponse courte et claire.",
-      webEnabled ? "Note: la recherche web est demandée, mais si aucune source n'est fournie, indique que tu réponds sans navigation." : "",
-    ].filter(Boolean);
+    // conversationId : si absent, on en crée un
+    const convId = (conversationId ?? "").toString().trim() || `c_${Date.now()}`;
 
+    // --- A1 : system prompt pro ---
+    const systemPrompt = `
+Tu es "Olympeus AI", assistant francophone spécialisé en droit (priorité : droit administratif).
+Règles :
+- Réponds en français, clairement, sans jargon inutile.
+- Structure la réponse (phrases courtes, si utile : puces).
+- Si l'utilisateur demande "3 lignes", fais exactement ~3 lignes.
+- Ne mens jamais : si tu n'es pas sûr, dis-le.
+- Pas de conseil juridique personnalisé : formule en information générale et recommande un professionnel si nécessaire.
+`.trim();
+
+    // --- A2 : mémoire courte ---
+    const history = memory.get(convId) || [];
     const messages = [
-      { role: "system", content: systemParts.join(" ") },
-      { role: "user", content: message },
+      { role: "system", content: systemPrompt },
+      ...history,
+      { role: "user", content: msg },
     ];
 
-    // 4) Appel OpenAI (Chat Completions)
-    const resp = await fetch("https://api.openai.com/v1/chat/completions", {
+    // Appel OpenAI (endpoint compat)
+    const r = await fetch("https://api.openai.com/v1/chat/completions", {
       method: "POST",
       headers: {
         Authorization: `Bearer ${OPENAI_API_KEY}`,
         "Content-Type": "application/json",
       },
       body: JSON.stringify({
-        model: OPENAI_MODEL,
+        model: MODEL, // ex: "gpt-4o"
+        temperature: 0.4,
+        max_tokens: 350,
         messages,
-        temperature: expert ? 0.4 : 0.7,
       }),
     });
 
-    const data = await resp.json().catch(() => null);
+    const data = await r.json().catch(() => null);
 
-    if (!resp.ok) {
-      // Log côté serveur (Render)
-      console.error("OpenAI error:", resp.status, data);
+    if (!r.ok) {
+      // B3 : log propre (sans secrets)
+      console.error("❌ OpenAI error:", r.status, data?.error?.message || data);
       return res.status(502).json({
         ok: false,
         error: "upstream_openai_error",
-        status: resp.status,
+        details: data?.error?.message || "unknown",
       });
     }
 
     const answer =
-      data?.choices?.[0]?.message?.content?.trim() ||
-      "Réponse vide (OpenAI).";
+      data?.choices?.[0]?.message?.content?.trim() || "(Réponse vide)";
 
-    // 5) Réponse vers WP
+    // Mise à jour mémoire
+    const newHistory = [
+      ...history,
+      { role: "user", content: msg },
+      { role: "assistant", content: answer },
+    ].slice(-MAX_TURNS);
+
+    memory.set(convId, newHistory);
+
     return res.json({
       ok: true,
       answer,
-      conversationId: conversationId || Date.now().toString(),
+      conversationId: convId,
     });
   } catch (err) {
-    console.error("Server error:", err);
+    console.error("❌ Server error:", err?.message || err);
     return res.status(500).json({ ok: false, error: "server_error" });
   }
 });
 
-// ===============================
-// START
-// ===============================
 app.listen(PORT, () => {
   console.log(`✅ Olympeus AI server running on port ${PORT}`);
 });
